@@ -7,6 +7,28 @@ enum DYDuoMetrics {
     /// iOS 17–27.0 的宽屏回退，和改版前同一条线。
     static let legacyWideMin: CGFloat = 700
 
+    /// 右侧按钮栏宽度（actions 里 .frame(width: 54)），和下面的「…」按钮同一条中线
+    static let railWidth: CGFloat = 54
+    /// 读不到摄像头预留区域时（内屏、iOS 27.1 以下、外屏倒拿摄像头在左）的右边距
+    static let railDefaultTrailing: CGFloat = 12
+
+    /// 右侧按钮栏右边距。HIG（Designing for iPhone Duo）：外屏前置摄像头「与侧边控件垂直对齐」，
+    /// 摄像头 / 状态栏 / 工具栏是同一列 → 按钮栏中线对齐外屏摄像头的 occlusion 预留区域，不写死像素。
+    /// 只认贴着右缘的那块（外屏摄像头）；内屏摄像头激活时在别处，不跟着跳。
+    static func railTrailing(_ proxy: GeometryProxy) -> CGFloat {
+        if #available(iOS 27.1, *) {
+            let w = proxy.size.width
+            guard w > 1 else { return railDefaultTrailing }
+            let cams = proxy.reservedRegions(kind: .occlusion).filter { r in
+                r.isActive && r.frame.width > 1 && w - r.frame.midX < 120 && w - r.frame.midX > railWidth / 2
+            }
+            if let cam = cams.min(by: { $0.frame.minY < $1.frame.minY }) {
+                return max(0, w - cam.frame.midX - railWidth / 2)
+            }
+        }
+        return railDefaultTrailing
+    }
+
     /// 折痕是否处于激活状态（半折叠）。iOS 27.1 以下恒为 false。
     static func foldIsActive(_ proxy: GeometryProxy) -> Bool {
         if #available(iOS 27.1, *) {
@@ -14,6 +36,11 @@ enum DYDuoMetrics {
         }
         return false
     }
+}
+
+struct DYRailTrailingPref: PreferenceKey {
+    static var defaultValue: CGFloat { DYDuoMetrics.railDefaultTrailing }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 // MARK: - 折痕 / 摄像头：整组小幅平移，不大挪

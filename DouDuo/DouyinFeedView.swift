@@ -1857,6 +1857,8 @@ struct DYVideoPage: View {
     var onEnded: (() -> Void)? = nil
     @AppStorage("douyin_autoplay_v1") private var autoNext = false
     @State private var heart = false
+    /// 右侧按钮栏右边距：外屏按摄像头预留区域算（中线对齐状态栏那一列），读不到用默认值
+    @State private var railTrailing: CGFloat = DYDuoMetrics.railDefaultTrailing
     @State private var descExpanded = false
     @State private var danmaku: [DYDanmaku] = []
     @State private var danmakuLoaded = false
@@ -1936,18 +1938,28 @@ struct DYVideoPage: View {
                     .offset(y: item.images.isEmpty ? Self.infoDrop : 0)
                 Spacer(minLength: 0)
                 actions(fg)
-                    // 右侧按钮栏中线对齐右上角系统状态栏（时间 / Wi‑Fi 那一列）：
-                    // 按截图实测状态栏中线离右边约 48pt，按钮栏宽 54 → 右边距 12 + 9 = 21pt
-                    .padding(.trailing, Self.railExtraTrailing)
                     .modifier(DYRailReservedNudge())
             }
-            .padding(.horizontal, 12)
+            // 苹果 iPhone Duo 规范：
+            // · 左下信息是前景控件 → 放在安全区内，左右分开算（不假设两边一样）。外屏倒拿 / 分屏在左半边时，
+            //   系统那一列（摄像头、状态栏）跑到左侧，信息块自动让开
+            // · 右侧按钮栏和摄像头、状态栏同一列（HIG：外屏摄像头与侧边控件垂直对齐）→ 中线对齐摄像头预留区域
+            .padding(.leading, insets.leading + 12)
+            .padding(.trailing, railTrailing)
             .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 92 : 24))   // 让开底部时间 + 进度条 + 拖动区
         }
         .overlay(alignment: .bottom) {
             if showDanmakuInput { danmakuBar.padding(.bottom, max(insets.bottom, 12) + 6) }
         }
         .animation(.snappy, value: heart)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: DYRailTrailingPref.self, value: DYDuoMetrics.railTrailing(proxy))
+            }
+        }
+        .onPreferenceChange(DYRailTrailingPref.self) { v in
+            if abs(v - railTrailing) > 0.5 { railTrailing = v }
+        }
         .onChange(of: isCurrent) { _, c in if !c { showDanmakuInput = false } }
         // 弹幕：轮到这条时才拉（一次拉整条视频的）
         .task(id: isCurrent) {
@@ -2029,8 +2041,6 @@ struct DYVideoPage: View {
     /// 小红书式左下信息区：头像 + 昵称 + 红色「关注」胶囊，下面文案 / 音乐
     /// 视频页左下信息块相对按钮栏往下挪的距离
     static let infoDrop: CGFloat = 48
-    /// 右侧按钮栏在默认 12pt 右边距之外再往左收的距离（对齐状态栏中线）
-    static let railExtraTrailing: CGFloat = 9
 
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 6) {

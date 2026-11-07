@@ -9,9 +9,11 @@ enum DYDuoMetrics {
 
     /// 折痕是否处于激活状态（半折叠）。iOS 27.1 以下恒为 false。
     static func foldIsActive(_ proxy: GeometryProxy) -> Bool {
+        #if !DD_NO_IOS27_SDK
         if #available(iOS 27.1, *) {
             return proxy.reservedRegions(kind: .division).contains { $0.isActive }
         }
+        #endif
         return false
     }
 }
@@ -27,14 +29,20 @@ private struct DYNudgePref: PreferenceKey {
 /// 测量放在未平移的布局框上，平移只作用于内容，避免来回抖。
 struct DYRailReservedNudge: ViewModifier {
     func body(content: Content) -> some View {
+        #if !DD_NO_IOS27_SDK
         if #available(iOS 27.1, *) {
             DYRailReservedNudgeBox { content }
         } else {
             content
         }
+        #else
+        content
+        #endif
     }
 }
 
+// 云端 CI 只有 iOS 26 SDK 时（DD_NO_IOS27_SDK）不编译 iOS 27.1 专属的折痕 / 遮挡区代码
+#if !DD_NO_IOS27_SDK
 @available(iOS 27.1, *)
 private struct DYRailReservedNudgeBox<Content: View>: View {
     @ViewBuilder var content: () -> Content
@@ -169,6 +177,8 @@ struct DYDuoCommentPrimary: View {
         .transition(.move(edge: .trailing))
     }
 }
+
+#endif
 
 /// 外屏（非 regular）评论走系统 sheet，挂在 ArrangementView 外面，避免 sheet 被姿态容器吃掉。
 struct DYOuterCommentSheet: ViewModifier {

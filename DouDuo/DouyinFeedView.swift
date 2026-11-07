@@ -627,24 +627,42 @@ final class DYPreloader {
         for (id, p) in players where !ids.contains(id) { release(id, p) }
         let near = Set(items[max(0, index - 1)...min(items.count - 1, index + 1)].map(\.id))
         handedOut = handedOut.filter { near.contains($0) || ids.contains($0) }
-        for a in window where players[a.id] == nil && !handedOut.contains(a.id) {
-            guard a.images.isEmpty, let s = a.play, let url = URL(string: s) else {
-                if let c = a.images.first.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c) } }
-                continue
-            }
-            let item = AVPlayerItem(asset: DYMedia.asset(DYVideoCache.localURL(a.id) ?? url))
-            item.preferredForwardBufferDuration = 6
-            let p = AVPlayer(playerItem: item)
-            p.isMuted = true
-            p.automaticallyWaitsToMinimizeStalling = true
-            players[a.id] = p
-            // ready 后 preroll：把开头的数据和首帧解码好
-            obs[a.id] = item.observe(\.status, options: [.new]) { [weak p] it, _ in
-                guard it.status == .readyToPlay else { return }
-                DispatchQueue.main.async { p?.preroll(atRate: 1) { _ in } }
-            }
-            if let c = a.cover.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c) } }
+        // 错峰：紧挨着的下一条马上暖；再往后的等当前这条先起播一会儿再开，
+        // 不然一滑过来当前条要和 2～3 路预加载同时抢带宽 / 解码，起播反而变慢、开头卡
+        laterTask?.cancel()
+        if let next = window.first { warm(next) }
+        let rest = window.dropFirst()
+        guard !rest.isEmpty else { return }
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            for a in rest { self.warm(a) }
         }
+        laterTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: task)
+    }
+
+    private var laterTask: DispatchWorkItem?
+
+    private func warm(_ a: DYAweme) {
+        guard players[a.id] == nil, !handedOut.contains(a.id) else { return }
+        guard a.images.isEmpty, let s = a.play, let url = URL(string: s) else {
+            if let c = a.images.first.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c) } }
+            return
+        }
+        let local = DYVideoCache.localURL(a.id)
+        let item = AVPlayerItem(asset: DYMedia.asset(local ?? url))
+        // 本地文件不用预缓冲；在线的只要开头几秒够起播就行，缓多了是在跟当前条抢带宽
+        item.preferredForwardBufferDuration = local != nil ? 2 : 4
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = true
+        p.automaticallyWaitsToMinimizeStalling = true
+        players[a.id] = p
+        // ready 后 preroll：把开头的数据和首帧解码好
+        obs[a.id] = item.observe(\.status, options: [.new]) { [weak p] it, _ in
+            guard it.status == .readyToPlay else { return }
+            DispatchQueue.main.async { p?.preroll(atRate: 1) { _ in } }
+        }
+        if let c = a.cover.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c) } }
     }
 
     /// 页面起播时来领；领走后由页面负责释放
@@ -653,10 +671,14 @@ final class DYPreloader {
         obs.removeValue(forKey: id)?.invalidate()
         handedOut.insert(id)
         p.isMuted = false
+        // 预加载时为省流量限了前向缓冲；变成正在看的这条就交还给系统自动管理，
+        // 否则网一抖只有几秒余量，播着播着就卡住转圈
+        p.currentItem?.preferredForwardBufferDuration = 0
         return p
     }
 
     func clear() {
+        laterTask?.cancel(); laterTask = nil
         for (id, p) in players { release(id, p) }
         handedOut.removeAll()
     }
@@ -1040,6 +1062,9 @@ struct DouyinFeedScreen: View {
         let ahead = Array(feed.items.dropFirst(i + 1))
         Task {
             await DYVideoCache.shared.markWatched(curID)
+            // 整条下载晚 1.5 秒再排：让刚滑到的这条先把开头缓冲好；期间又滑走了就交给下一次
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard currentID == curID else { return }
             await DYVideoCache.shared.enqueue(ahead)
         }
         // 后面不足「缓存条数」就继续拉推荐（至少保证 6 条，节流 4 秒一次）
@@ -1463,16 +1488,11 @@ final class DYLiveModel: ObservableObject {
     private var sizeObs: AnyCancellable?
 
     /// 直播日志：Release 也要能用（ddWrite 只在 DEBUG 编译），排查真机「有声无画」靠它
+    /// 以前每条都在主线程新建 DateFormatter + 同步开关文件，滑动 / 切房间时一次打好几条 → 掉帧；
+    /// 而且 Release 里文件只增不减。现在丢到后台串行队列写，超过 2MB 只留后一半。
     nonisolated static func log(_ s: String) {
-        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-        let url = dir.appendingPathComponent("ddlog.txt")
-        let df = DateFormatter(); df.dateFormat = "HH:mm:ss"
-        let line = df.string(from: Date()) + " " + s + "\n"
-        if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
-        } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
-        }
+        let now = Date()
+        DDLogWriter.queue.async { DDLogWriter.write(now, s) }
     }
 
     init() {
@@ -1566,13 +1586,19 @@ private struct DYLiveFeed: View {
     let bridge: DouyinBridge
     @ObservedObject var model: DYLiveModel
     let onWeb: (URL) -> Void
-    @StateObject private var chat = DYLiveChat()
+    /// ⚠️ 不能直接 @StateObject DYLiveChat：热门直播间每秒都有新弹幕，owner 会跟着整页重算
+    /// （ScrollView + VLC 渲染层 updateUIView 一起刷）→ 直播一顿一顿。包一层不发通知的盒子，
+    /// 只让左下角聊天浮层自己订阅。
+    @StateObject private var chatBox = DYLiveChatBox()
+    private var chat: DYLiveChat { chatBox.chat }
     @State private var liveDraft = ""
     @State private var liveSending = false
     @State private var liveErr: String?
     @FocusState private var liveFocused: Bool
     @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
-    @State private var tick = 0      // 0.5s 刷新一次，让调试进度文案跟着走
+    #if DEBUG
+    @State private var tick = 0      // 0.5s 刷新一次，让调试进度文案跟着走（只在调试包里：Release 每 0.5s 整页重算会卡）
+    #endif
     @State private var scrollID: String?
     @State private var userScrolling = false
 
@@ -1613,7 +1639,7 @@ private struct DYLiveFeed: View {
                         ForEach(model.rooms) { room in
                             DYLivePage(room: room, vlc: model.currentID == room.id ? model.vlc : nil,
                                        ready: model.ready, onWeb: onWeb,
-                                       chat: (danmakuOn && model.currentID == room.id) ? chat.messages : [],
+                                       chat: (danmakuOn && model.currentID == room.id) ? chat : nil,
                                        chatInput: model.currentID == room.id ? AnyView(liveInput) : nil)
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(room.id)
@@ -1688,7 +1714,9 @@ private struct DYLiveFeed: View {
         .onChange(of: model.currentID) { _, id in openChat(id) }
         .onChange(of: danmakuOn) { _, on in if on { openChat(model.currentID) } else { chat.close() } }
         .onAppear { openChat(model.currentID) }
+        #if DEBUG
         .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in tick += 1 }
+        #endif
     }
 }
 
@@ -1740,7 +1768,8 @@ private struct DYLivePage: View {
     let vlc: VLCPlayerController?
     let ready: Bool
     let onWeb: (URL) -> Void
-    var chat: [DYLiveMsg] = []
+    /// 只有当前房间且开了弹幕才传；浮层自己订阅消息，新消息不会让整页（含 VLC 画面）重算
+    var chat: DYLiveChat? = nil
     var chatInput: AnyView? = nil
 
     var body: some View {
@@ -1767,7 +1796,7 @@ private struct DYLivePage: View {
                                startPoint: .center, endPoint: .bottom)
                     .allowsHitTesting(false)
                 VStack(alignment: .leading, spacing: 8) {
-                    if !chat.isEmpty { DYLiveChatOverlay(messages: chat).padding(.bottom, 6) }
+                    if let chat { DYLiveChatLiveOverlay(chat: chat) }
                     HStack(spacing: 8) {
                         CachedAsyncImage(url: room.avatar.flatMap(URL.init(string:))) { img in img.resizable().scaledToFill() }
                             placeholder: { theme.media.chromeFill.color(for: scheme) }
@@ -2421,5 +2450,38 @@ struct DYCommentPanel: View {
             self.error = error.localizedDescription
             hasMore = false
         }
+    }
+}
+
+/// DYLiveModel.log 的后台写入器（只在 queue 上访问）
+enum DDLogWriter {
+    static let queue = DispatchQueue(label: "douduo.log", qos: .utility)
+    private static let maxBytes: UInt64 = 2 * 1024 * 1024
+    private static let formatter: DateFormatter = {
+        let df = DateFormatter(); df.dateFormat = "HH:mm:ss"; return df
+    }()
+    private static let url: URL? = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("ddlog.txt")
+    private static var handle: FileHandle?
+
+    static func write(_ date: Date, _ s: String) {
+        guard let url else { return }
+        let line = Data((formatter.string(from: date) + " " + s + "\n").utf8)
+        if handle == nil {
+            if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+            handle = try? FileHandle(forWritingTo: url)
+        }
+        guard let h = handle else { return }
+        let end = (try? h.seekToEnd()) ?? 0
+        if end > maxBytes {
+            // 只留后一半（最近的日志）
+            try? h.close(); handle = nil
+            if let data = try? Data(contentsOf: url) {
+                try? data.suffix(data.count / 2).write(to: url, options: .atomic)
+            }
+            handle = try? FileHandle(forWritingTo: url)
+            _ = try? handle?.seekToEnd()
+        }
+        try? handle?.write(contentsOf: line)
     }
 }

@@ -389,8 +389,11 @@ struct DYDanmakuLayer: View {
             let placed = DYDanmakuLayout.shared.get(renderItems, w: w, lanes: lanes, speed: speed)
             TimelineView(.animation(minimumInterval: nil, paused: !clock.playing)) { ctx in
                 let t = clock.now(ctx.date)
+                // ⚠️ symbols 只放「此刻在屏上」的几十条：以前把整条视频的弹幕（几百上千条 Text）都塞进 symbols，
+                // TimelineView 每帧（120Hz）都要把它们全部重新 diff 一遍 → 弹幕多的视频明显掉帧。
+                let visible = Self.visible(placed, at: t)
                 Canvas(rendersAsynchronously: false) { gc, _ in
-                    for p in placed where t >= p.d.offset && t <= p.d.offset + p.dur {
+                    for p in visible {
                         let x = w - CGFloat(t - p.d.offset) * speed
                         let y = topInset + 64 + CGFloat(p.lane) * Self.laneHeight
                         guard let sym = gc.resolveSymbol(id: p.d.id) else { continue }
@@ -398,7 +401,7 @@ struct DYDanmakuLayer: View {
                     }
                 } symbols: {
                     // 每条弹幕只排版一次（文字 + 阴影），之后每帧只是贴图挪位置，开销很小
-                    ForEach(placed, id: \.d.id) { p in
+                    ForEach(visible, id: \.d.id) { p in
                         Text(p.d.text)
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.92))
@@ -412,6 +415,25 @@ struct DYDanmakuLayer: View {
             .frame(width: w, height: g.size.height)
         }
         .allowsHitTesting(false)
+    }
+
+    /// placed 已按 offset 升序：二分找到 offset ≤ t 的末尾，往前扫到「最长一条也已飘完」为止
+    fileprivate static func visible(_ placed: [Placed], at t: Double) -> [Placed] {
+        guard !placed.isEmpty else { return [] }
+        var lo = 0, hi = placed.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if placed[mid].d.offset <= t { lo = mid + 1 } else { hi = mid }
+        }
+        var out: [Placed] = []
+        var i = lo - 1
+        // 单条最长停留约 7s + 文字宽度；往前多看 30s 足够（超长文字也飘不了这么久）
+        while i >= 0, t - placed[i].d.offset <= 30 {
+            let p = placed[i]
+            if t <= p.d.offset + p.dur { out.append(p) }
+            i -= 1
+        }
+        return out.reversed()
     }
 
     /// 屏幕宽 + 一段余量，约 7 秒飘完

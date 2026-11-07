@@ -78,7 +78,7 @@ final class ImageCache {
     func diskCachedAsync(_ url: URL) async -> UIImage? {
         let path = diskPath(url)
         guard let data = try? Data(contentsOf: path) else { return nil }
-        guard let img = UIImage(data: data) else { return nil }
+        guard let img = Self.decoded(data) else { return nil }
         let cost = img.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
         cache.setObject(img, forKey: url as NSURL, cost: cost)
         return img
@@ -87,6 +87,13 @@ final class ImageCache {
     /// 读原图磁盘缓存的原始字节（后台线程调用）
     func diskData(_ url: URL) -> Data? {
         try? Data(contentsOf: diskPath(url))
+    }
+
+    /// UIImage(data:) 是懒解码：第一次上屏才在主线程解，视频封面（整屏大图）正好赶在滑到下一条的那一帧 → 卡一下。
+    /// 这里在后台线程就解好（preparingForDisplay），上屏只是贴图。
+    nonisolated static func decoded(_ data: Data) -> UIImage? {
+        guard let img = UIImage(data: data) else { return nil }
+        return img.preparingForDisplay() ?? img
     }
 
     func storeMemory(_ img: UIImage, for key: URL, cost: Int) {
@@ -133,7 +140,7 @@ final class ImageCache {
                 // 写磁盘持久化（后台队列，不阻塞）
                 let path = self.diskPath(url)
                 self.io.async { try? data.write(to: path, options: .atomic) }
-                return UIImage(data: data)
+                return Self.decoded(data)
             } catch { return nil }
         }
     }

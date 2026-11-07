@@ -636,7 +636,7 @@ struct PlayerPage: View {
             if !firstFrame, pos > 0.02 { withAnimation(.easeOut(duration: 0.2)) { firstFrame = true } }
             if isActive { DDNowPlaying.id = id; DDNowPlaying.time = pos }
             dmClock.sync(pos, playing: v.isPlaying && !seeking, rate: Double(v.mediaPlayer.rate))
-            if v.duration > 0 { duration = v.duration }
+            if v.duration > 0, v.duration != duration { duration = v.duration }
         }
         v.onEnd = { [weak v] in
             DispatchQueue.main.async {
@@ -659,7 +659,8 @@ struct PlayerPage: View {
                 if !firstFrame, t.seconds > 0.02 { withAnimation(.easeOut(duration: 0.2)) { firstFrame = true } }
                 if isActive { DDNowPlaying.id = id; DDNowPlaying.time = t.seconds }
                 dmClock.sync(t.seconds, playing: p.rate > 0 && !seeking, rate: Double(p.rate))
-                if let d = p.currentItem?.duration.seconds, d.isFinite, d > 0 { duration = d }
+                // 只在变化时写 @State：每 0.25s 写一次同值也会让整页（含弹幕层、手势层）重算
+                if let d = p.currentItem?.duration.seconds, d.isFinite, d > 0, d != duration { duration = d }
             }
         }
         endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,

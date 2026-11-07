@@ -22,11 +22,22 @@ struct DYFeedSession: Codable {
               session.items.contains(where: { $0.id == session.currentID }) else { return nil }
         return session
     }
+    /// 后台串行写：推荐列表能有上百条，每 5 秒在主线程整份 JSON 编码 + 落盘会让播放一顿
+    private static let saveQueue = DispatchQueue(label: "douduo.session", qos: .utility)
+    /// 只写最新一份：排队期间又来了新的，旧的直接丢弃
+    private static var pendingGen = 0
+    private static let genLock = NSLock()
+
     func save() {
-        guard items.contains(where: { $0.id == currentID }),
-              let data = try? JSONEncoder().encode(self) else { return }
-        do { try data.write(to: Self.url, options: .atomic) }
-        catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
+        guard items.contains(where: { $0.id == currentID }) else { return }
+        let snapshot = self
+        Self.genLock.lock(); Self.pendingGen += 1; let gen = Self.pendingGen; Self.genLock.unlock()
+        Self.saveQueue.async {
+            Self.genLock.lock(); let latest = Self.pendingGen; Self.genLock.unlock()
+            guard gen == latest, let data = try? JSONEncoder().encode(snapshot) else { return }
+            do { try data.write(to: Self.url, options: .atomic) }
+            catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
+        }
     }
 }
 
@@ -146,7 +157,8 @@ actor DYVideoCache {
             guard let s = a.play, let u = URL(string: s) else { continue }
             active.insert(a.id)
             Self.activeDownloads = active.count
-            Task { await self.download(a, u) }
+            // 低优先级：别跟正在看的那条抢带宽（URLSession 会按 Task 优先级排）
+            Task(priority: .background) { await self.download(a, u) }
         }
     }
 

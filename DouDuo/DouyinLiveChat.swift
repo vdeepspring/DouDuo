@@ -150,6 +150,20 @@ final class DYLiveChat: NSObject, ObservableObject, WKNavigationDelegate {
     """#
 }
 
+/// 只持有、不转发通知：父视图拿着它不会因为每条新弹幕整页重算
+@MainActor
+final class DYLiveChatBox: ObservableObject {
+    let chat = DYLiveChat()
+}
+
+/// 订阅聊天消息的那一小块：新消息只重算这里
+struct DYLiveChatLiveOverlay: View {
+    @ObservedObject var chat: DYLiveChat
+    var body: some View {
+        if !chat.messages.isEmpty { DYLiveChatOverlay(messages: chat.messages).padding(.bottom, 6) }
+    }
+}
+
 /// 挂进窗口，JS 定时器 / WebSocket 才不被系统节流
 struct DYLiveChatHost: UIViewRepresentable {
     let chat: DYLiveChat

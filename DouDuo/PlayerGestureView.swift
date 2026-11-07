@@ -11,6 +11,8 @@ struct PlayerGestureView: UIViewRepresentable {
     var onSingleTap: () -> Void
     var onDoubleTap: (CGFloat, CGFloat) -> Void          // (触点x, 宽度)
     var onLongPress: (Bool) -> Void                       // pressing
+    /// 长按中手指往下滑过阈值：锁定 2 倍速（松手后保持），每次长按最多触发一次
+    var onLongPressLock: () -> Void = {}
     var onSeekBegan: () -> Void
     var onSeekChanged: (CGFloat, CGFloat) -> Void         // (横向位移, 宽度)
     var onSeekEnded: () -> Void
@@ -72,6 +74,16 @@ struct PlayerGestureView: UIViewRepresentable {
         weak var edge: UIScreenEdgePanGestureRecognizer?
         init(_ p: PlayerGestureView) { parent = p }
 
+        /// 长按下滑锁定：下滑超过这个距离就锁
+        static let lockDistance: CGFloat = 50
+        private var longStart: CGPoint = .zero
+        private var longLocked = false
+        private var longActive = false
+        /// 长按期间临时关掉外层分页滚动，否则「长按后下滑」会被当成翻到上一条
+        private weak var pausedScroll: UIScrollView?
+        /// 长按中途视图被拆掉（换页 / 退出）收不到 ended：兜底把分页滚动恢复
+        deinit { pausedScroll?.isScrollEnabled = true }
+
         @objc func handleSingle(_ g: UITapGestureRecognizer) { parent.onSingleTap() }
 
         @objc func handleDouble(_ g: UITapGestureRecognizer) {
@@ -80,10 +92,40 @@ struct PlayerGestureView: UIViewRepresentable {
         }
 
         @objc func handleLong(_ g: UILongPressGestureRecognizer) {
+            guard let v = view else { return }
             switch g.state {
-            case .began: parent.onLongPress(true)
-            case .ended, .cancelled, .failed: parent.onLongPress(false)
+            case .began:
+                longStart = g.location(in: v)
+                longLocked = false
+                longActive = true
+                lockOuterScroll(true)
+                parent.onLongPress(true)
+            case .changed:
+                let dy = g.location(in: v).y - longStart.y
+                if !longLocked, dy > Self.lockDistance {
+                    longLocked = true
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    parent.onLongPressLock()
+                }
+            case .ended, .cancelled, .failed:
+                longActive = false
+                lockOuterScroll(false)
+                parent.onLongPress(false)
             default: break
+            }
+        }
+
+        private func lockOuterScroll(_ lock: Bool) {
+            if lock {
+                var s = view?.superview
+                while let cur = s, !(cur is UIScrollView) { s = cur.superview }
+                if let sv = s as? UIScrollView, sv.isScrollEnabled {
+                    sv.isScrollEnabled = false
+                    pausedScroll = sv
+                }
+            } else {
+                pausedScroll?.isScrollEnabled = true
+                pausedScroll = nil
             }
         }
 
@@ -116,6 +158,7 @@ struct PlayerGestureView: UIViewRepresentable {
 
         func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
             if g is UIScreenEdgePanGestureRecognizer { return true }   // 边缘退出始终允许
+            if longActive, g is UIPanGestureRecognizer { return false } // 长按中（2 倍速 / 下滑锁定）不起快进
             guard let pg = g as? UIPanGestureRecognizer, let v = view else { return true }
             let vel = pg.velocity(in: v)
             // 底部 ~64pt 留给底部进度条手势，避免与全屏横滑重复触发
@@ -139,6 +182,7 @@ struct PlayerGestureView: UIViewRepresentable {
             if let pg = pan, pg.state == .began || pg.state == .changed {
                 return false   // 正在拖进度，独占
             }
+            if longActive { return false }   // 长按中：下滑是「锁定 2 倍速」，不能同时让分页滚走
             return true        // Pan 还没开始或已结束，让 ScrollView 自由分页
         }
     }

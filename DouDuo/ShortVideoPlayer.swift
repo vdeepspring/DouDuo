@@ -141,6 +141,8 @@ struct PlayerPage: View {
     @State private var lastPreviewAt: Double = 0
     @State private var holdAnchor: Double = 0
     @State private var rateBoost = false
+    /// 长按后下滑锁定的 2 倍速：松手继续 2 倍速，单击取消、换条自动取消
+    @State private var rateLocked = false
     @State private var dmClock = DYDanmakuClock()
     @State private var timeToken: Any?
     @State private var endObserver: NSObjectProtocol?
@@ -194,7 +196,7 @@ struct PlayerPage: View {
                     .allowsHitTesting(false)
             }
             if rateBoost {
-                Label("2 倍速播放中", systemImage: "forward.fill")
+                Label(rateLocked ? "已锁定 2 倍速 · 单击取消" : "2 倍速播放中 · 下滑锁定", systemImage: rateLocked ? "lock.fill" : "forward.fill")
                     .font(.caption.weight(.semibold)).foregroundStyle(.white)
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Capsule().fill(.black.opacity(0.45)))
@@ -229,6 +231,7 @@ struct PlayerPage: View {
             vlc?.mediaPlayer.audio?.isMuted = m
         }
         .onChange(of: isActive) { _, active in
+            if !active, rateLocked || rateBoost { unlockRate(resume: false) }   // 滑走就取消倍速，回来按 1 倍
             if let v = vlc {
                 if active { v.mediaPlayer.audio?.isMuted = muted; v.mediaPlayer.play(); isPlaying = true }
                 else { v.mediaPlayer.pause(); isPlaying = false; onSavePosition(v.current) }
@@ -262,16 +265,24 @@ struct PlayerPage: View {
 
     private var gestures: some View {
         PlayerGestureView(
-            onSingleTap: { togglePlay() },
+            onSingleTap: { if rateLocked { unlockRate() } else { togglePlay() } },
             onDoubleTap: { _, _ in onDoubleTap?() },
             onLongPress: { pressing in
                 if let v = vlc {
-                    if pressing { v.setRate(2); rateBoost = true } else if rateBoost { v.setRate(1); rateBoost = false }
+                    if pressing { v.setRate(2); rateBoost = true }
+                    else if rateBoost, !rateLocked { v.setRate(1); rateBoost = false }
                     return
                 }
                 guard let p = player else { return }
                 if pressing { p.rate = 2; rateBoost = true }
-                else if rateBoost { p.rate = isPlaying ? 1 : 0; rateBoost = false }
+                else if rateBoost, !rateLocked { p.rate = isPlaying ? 1 : 0; rateBoost = false }
+            },
+            onLongPressLock: {
+                guard rateBoost else { return }
+                rateLocked = true
+                // 循环回开头 / 回前台 / 暂停后再播都调 play()，play() 按 defaultRate 起播 → 锁定期间一直 2 倍速
+                player?.defaultRate = 2
+                hdPlayer?.defaultRate = 2
             },
             onSeekBegan: {
                 guard duration > 0 else { return }
@@ -577,6 +588,7 @@ struct PlayerPage: View {
         let item = AVPlayerItem(asset: DYMedia.asset(altURL ?? url))
         let p = AVPlayer(playerItem: item)
         p.automaticallyWaitsToMinimizeStalling = true
+        if rateLocked { p.defaultRate = 2 }   // 重建播放项也保持已锁定的 2 倍速
         player = p
         attachObservers(p)
         p.isMuted = muted
@@ -644,6 +656,7 @@ struct PlayerPage: View {
             }
         }
         v.play(url: url, autoplay: isActive, headers: DYMedia.headers)
+        if rateLocked { v.setRate(2) }
         vlc = v
         #if DEBUG
         ddWrite("DDVLC takeover \(id)")
@@ -677,6 +690,16 @@ struct PlayerPage: View {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
+    }
+
+    /// 取消 2 倍速（锁定或长按中）。resume=false：只恢复倍率设置，不改播放/暂停状态
+    private func unlockRate(resume: Bool = true) {
+        rateLocked = false
+        rateBoost = false
+        player?.defaultRate = 1
+        hdPlayer?.defaultRate = 1
+        if let v = vlc { v.setRate(1); return }
+        if resume, let p = player { p.rate = isPlaying ? 1 : 0 }
     }
 
     private func togglePlay() {

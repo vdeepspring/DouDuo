@@ -117,27 +117,33 @@ final class DouDuoUITests: XCTestCase {
         XCUIDevice.shared.orientation = .portrait
     }
 
-    /// 菜单里的「自动铺满宽度」开关：开=竖屏窄视频放大铺满，关=完整画面留边
-    func testAutoFitToggle() throws {
+    /// 「更多」菜单：一排快捷图标 + 播放组 + 设置子菜单；竖屏占比子菜单可选
+    func testMoreMenuLayout() throws {
         let app = XCUIApplication()
         app.launch()
         let current = app.staticTexts["douyin.currentID"]
         XCTAssertTrue(current.waitForExistence(timeout: 30))
         XCTAssertEqual(XCTWaiter().wait(for: [expectation(for: NSPredicate(format: "label != '-'"), evaluatedWith: current)], timeout: 60), .completed)
-        sleep(8)
-        attach(app, "fit-on")
-
-        app.buttons["抖音菜单"].tap()
-        // SwiftUI 菜单里的 Toggle 不是 Switch，按标签找任意类型（含按钮/菜单项）
-        let toggle = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS '自动铺满宽度'")).firstMatch
-        XCTAssertTrue(toggle.waitForExistence(timeout: 5), "菜单里没有自动铺满宽度")
-        toggle.tap()
-        app.tap()   // 关菜单
-        sleep(8)
-        attach(app, "fit-off")
-
-        app.buttons["抖音菜单"].tap()
-        app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS '自动铺满宽度'")).firstMatch.tap()
+        sleep(3)
+        let any = { (l: String) in app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH %@", l)).firstMatch }
+        // 分页里上下相邻页的「更多」也在树里，只点屏幕内那颗
+        let more = { app.buttons.matching(identifier: "douyin.more").allElementsBoundByIndex.first { $0.isHittable }! }
+        more().tap()
+        for l in ["转发", "下载", "不感兴趣", "竖屏占比", "自动连播", "静音", "显示弹幕", "刷新推荐", "我的", "设置"] {
+            XCTAssertTrue(any(l).waitForExistence(timeout: 5), "更多菜单缺少 \(l)")
+        }
+        attach(app, "more-top")
+        any("竖屏占比").tap()
+        XCTAssertTrue(any("竖屏 50%").waitForExistence(timeout: 5), "竖屏占比子菜单没展开")
+        attach(app, "more-mix")
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.15)).tap()
+        sleep(1)
+        more().tap()
+        any("设置").tap()
+        for l in ["横着看时只放横屏", "自动铺满宽度", "预缓存视频", "清除视频缓存", "网页版", "关于"] {
+            XCTAssertTrue(any(l).waitForExistence(timeout: 5), "设置子菜单缺少 \(l)")
+        }
+        attach(app, "more-settings")
     }
 
     /// VLC 兜底路径：强制 VLC 起播，画面时间要走、能上滑切换

@@ -162,7 +162,10 @@ struct PlayerPage: View {
                 // 画面铺到屏幕边缘（状态栏/底部安全区也盖住）：跟抖音原生一样，不留上下黑边
                 VLCPlayerSurface(controller: vlc, fillWidth: fillWidth).ignoresSafeArea()
             } else if let player {
-                VideoSurface(player: player, fillWidth: fillWidth).ignoresSafeArea()
+                // 画面层真正有帧可显示（isReadyForDisplay）就撤掉封面：预加载 / 本地缓存的视频滑过来就是真画面，
+                // 不再「先闪一下封面再播」
+                VideoSurface(player: player, fillWidth: fillWidth, onReady: { if !firstFrame { firstFrame = true } })
+                    .ignoresSafeArea()
             } else {
                 ProgressView().tint(.white)
             }
@@ -171,7 +174,8 @@ struct PlayerPage: View {
                 VideoSurface(player: hd, fillWidth: fillWidth).ignoresSafeArea()
                     .opacity(hdVisible ? 1 : 0.001).allowsHitTesting(false)
             }
-            if !firstFrame, let posterURL {
+            // 封面只给「还没缓存、还没出帧」的在线视频兜底；本地已缓存的直接等首帧（几十毫秒），不铺封面
+            if !firstFrame, !url.isFileURL, let posterURL {
                 GeometryReader { g in
                     let screen = g.size.width / max(g.size.height, 1)
                     let video = videoAspect > 0 ? videoAspect : screen
@@ -183,7 +187,6 @@ struct PlayerPage: View {
                 }
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
-                    .transition(.opacity)
             }
             if isActive && (!danmaku.isEmpty || dmStress) {
                 DYDanmakuLayer(items: danmaku, clock: dmClock, topInset: topInset)
@@ -645,7 +648,7 @@ struct PlayerPage: View {
         if knownDuration > 0 { v.setKnownDuration(knownDuration) }
         v.onProgress = { pos in
             if !seeking { current = pos }
-            if !firstFrame, pos > 0.02 { withAnimation(.easeOut(duration: 0.2)) { firstFrame = true } }
+            if !firstFrame, pos > 0.02 { firstFrame = true }
             if isActive { DDNowPlaying.id = id; DDNowPlaying.time = pos }
             dmClock.sync(pos, playing: v.isPlaying && !seeking, rate: Double(v.mediaPlayer.rate))
             if v.duration > 0, v.duration != duration { duration = v.duration }
@@ -669,7 +672,7 @@ struct PlayerPage: View {
         timeToken = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { t in
             MainActor.assumeIsolated {
                 if !seeking { current = t.seconds }
-                if !firstFrame, t.seconds > 0.02 { withAnimation(.easeOut(duration: 0.2)) { firstFrame = true } }
+                if !firstFrame, t.seconds > 0.02 { firstFrame = true }
                 if isActive { DDNowPlaying.id = id; DDNowPlaying.time = t.seconds }
                 dmClock.sync(t.seconds, playing: p.rate > 0 && !seeking, rate: Double(p.rate))
                 // 只在变化时写 @State：每 0.25s 写一次同值也会让整页（含弹幕层、手势层）重算
@@ -767,9 +770,12 @@ func ddWrite(_ s: String) {
 struct VideoSurface: UIViewRepresentable {
     let player: AVPlayer
     var fillWidth: Bool = true
+    /// 画面层第一次有帧可显示时回调（先按同向规则定好铺满方式再回调，不会先小后跳）
+    var onReady: (() -> Void)? = nil
     func makeUIView(context: Context) -> PlayerUIView {
         let v = PlayerUIView(player: player)
         v.fillWidth = fillWidth
+        v.onReady = onReady
         // 初始用 fit；真正的铺满由 applyGravity 按「是否同向」决定（surface 首帧前隐藏，看不到这中间态）
         v.playerLayer.videoGravity = .resizeAspect
         v.watchSize()
@@ -778,12 +784,15 @@ struct VideoSurface: UIViewRepresentable {
     func updateUIView(_ uiView: PlayerUIView, context: Context) {
         if uiView.playerLayer.player !== player { uiView.playerLayer.player = player; uiView.watchSize() }
         uiView.fillWidth = fillWidth
+        uiView.onReady = onReady
         uiView.applyGravity()
     }
 }
 
 final class PlayerUIView: UIView {
     var fillWidth = true
+    var onReady: (() -> Void)?
+    private var readyObs: NSKeyValueObservation?
     override static var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     init(player: AVPlayer) {
@@ -791,6 +800,10 @@ final class PlayerUIView: UIView {
         playerLayer.player = player
         playerLayer.videoGravity = .resizeAspect
         backgroundColor = .black
+        readyObs = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
+            guard layer.isReadyForDisplay else { return }
+            DispatchQueue.main.async { self?.applyGravity(); self?.onReady?() }
+        }
     }
     required init?(coder: NSCoder) { fatalError() }
 

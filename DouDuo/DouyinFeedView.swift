@@ -1954,7 +1954,7 @@ struct DYVideoPage: View {
         .animation(.snappy, value: heart)
         .background {
             GeometryReader { proxy in
-                Color.clear.preference(key: DYRailTrailingPref.self, value: DYDuoMetrics.railTrailing(proxy))
+                Color.clear.preference(key: DYRailTrailingPref.self, value: DYDuoMetrics.railTrailing(proxy, safeTrailing: insets.trailing))
             }
         }
         .onPreferenceChange(DYRailTrailingPref.self) { v in

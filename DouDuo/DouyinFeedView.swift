@@ -1930,7 +1930,10 @@ struct DYVideoPage: View {
 
             // 文案 / 右侧按钮栏压在播放器底部进度条上方（进度条 + 拖动条约 70pt）
             HStack(alignment: .bottom, spacing: 12) {
+                // 作者头像 / 名字 / 关注 / 文案整体下移，少压画面（横屏视频下沿常被挡）；
+                // 右侧按钮栏不动。下移后离进度条拖动区（约 36pt）仍留空，不抢拖进度
                 info(fg)
+                    .offset(y: item.images.isEmpty ? Self.infoDrop : 0)
                 Spacer(minLength: 0)
                 actions(fg)
                     .modifier(DYRailReservedNudge())
@@ -2021,6 +2024,9 @@ struct DYVideoPage: View {
     }
 
     /// 小红书式左下信息区：头像 + 昵称 + 红色「关注」胶囊，下面文案 / 音乐
+    /// 视频页左下信息块相对按钮栏往下挪的距离
+    static let infoDrop: CGFloat = 48
+
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {

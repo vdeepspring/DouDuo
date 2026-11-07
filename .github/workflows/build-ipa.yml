@@ -1,0 +1,59 @@
+# 云端编译未签名 IPA（不需要自己的 Mac 开机）
+# 触发：推送到 main / claude/** 分支，或在 Actions 页面手动点 Run workflow
+# 产物：Actions 运行页底部的 Artifacts → DouDuo-unsigned-ipa（下载后用爱思助手等自签安装）
+name: Build IPA
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选用最新 Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "使用 $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: 缓存 VLCKit（约 1GB）
+        uses: actions/cache@v4
+        with:
+          path: Vendor/VLCKit/VLCKit-all.xcframework
+          key: vlckit-3.6.0
+
+      - name: 下载 VLCKit
+        run: ./scripts/fetch-vlckit.sh
+
+      - name: 生成工程
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build/dd build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tail -50
+          test -d build/dd/Build/Products/Release-iphoneos/DouDuo.app
+
+      - name: 打包 IPA
+        run: |
+          VER=$(grep MARKETING_VERSION project.yml | awk '{print $2}')
+          BUILD=$(grep CURRENT_PROJECT_VERSION project.yml | awk '{print $2}' | tr -d '"')
+          mkdir -p build/ipa/Payload
+          cp -R build/dd/Build/Products/Release-iphoneos/DouDuo.app build/ipa/Payload/
+          (cd build/ipa && zip -qry "../DouDuo-$VER-$BUILD-unsigned.ipa" Payload)
+          ls -lh build/*.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DouDuo-unsigned-ipa
+          path: build/*.ipa
+          retention-days: 14

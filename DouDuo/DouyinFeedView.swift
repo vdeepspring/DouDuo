@@ -1936,6 +1936,9 @@ struct DYVideoPage: View {
                     .offset(y: item.images.isEmpty ? Self.infoDrop : 0)
                 Spacer(minLength: 0)
                 actions(fg)
+                    // 右侧按钮栏中线对齐右上角系统状态栏（时间 / Wi‑Fi 那一列）：
+                    // 按截图实测状态栏中线离右边约 48pt，按钮栏宽 54 → 右边距 12 + 9 = 21pt
+                    .padding(.trailing, Self.railExtraTrailing)
                     .modifier(DYRailReservedNudge())
             }
             .padding(.horizontal, 12)
@@ -2026,6 +2029,8 @@ struct DYVideoPage: View {
     /// 小红书式左下信息区：头像 + 昵称 + 红色「关注」胶囊，下面文案 / 音乐
     /// 视频页左下信息块相对按钮栏往下挪的距离
     static let infoDrop: CGFloat = 48
+    /// 右侧按钮栏在默认 12pt 右边距之外再往左收的距离（对齐状态栏中线）
+    static let railExtraTrailing: CGFloat = 9
 
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 6) {

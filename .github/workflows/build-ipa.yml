@@ -10,7 +10,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-26
+    # 源码用了 iOS 27.1 API，必须 Xcode 27（iOS 27.1+ SDK）；GitHub 的 Xcode 27 预览镜像标签是 xcode-27
+    runs-on: xcode-27
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -25,11 +26,11 @@ jobs:
           echo "使用 $XC"
           sudo xcode-select -s "$XC"
           xcodebuild -version
-          # 源码里有 iOS 27.1 专属 API；SDK 不够新就加编译开关跳过那部分
+          # 源码里有 iOS 27.1 专属 API：SDK 低于 27.1 直接失败，不出降级包
           SDK=$(xcrun --sdk iphoneos --show-sdk-version)
           echo "iOS SDK $SDK"
           if [ "$(printf '%s\n27.1\n' "$SDK" | sort -V | head -1)" != "27.1" ]; then
-            echo "EXTRA_FLAGS=DD_NO_IOS27_SDK" >> "$GITHUB_ENV"
+            echo "❌ iOS SDK $SDK < 27.1"; exit 1
           fi
 
       - name: 缓存 VLCKit（约 1GB）
@@ -49,12 +50,10 @@ jobs:
       - name: 编译（不签名）
         run: |
           mkdir -p build
-          echo "编译开关: ${EXTRA_FLAGS:-无}"
           STATUS=0
           xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release -sdk iphoneos \
             -destination 'generic/platform=iOS' -derivedDataPath build/dd build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            SWIFT_ACTIVE_COMPILATION_CONDITIONS="\$(inherited) $EXTRA_FLAGS" > build/xcodebuild.log 2>&1 || STATUS=$?
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO > build/xcodebuild.log 2>&1 || STATUS=$?
           grep -E "error:|\*\* BUILD" build/xcodebuild.log | sort -u | head -80 || true
           [ "$STATUS" -eq 0 ] || { echo "❌ xcodebuild 失败 ($STATUS)"; tail -40 build/xcodebuild.log; exit 1; }
           # 主程序必须存在且是 arm64 可执行文件，否则不出包（之前就是编译失败还打了个空壳包）

@@ -13,7 +13,7 @@ import AVFoundation
 
 // MARK: - 数据
 
-struct DYAweme: Identifiable, Codable, Equatable {
+struct DYAweme: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let desc: String
     let width: Double
@@ -834,6 +834,10 @@ final class DYFeedModel: ObservableObject {
     /// 竖屏占比（拿手机竖着看时）：-1 = 不限（网页推荐原样，约八成横屏）；30/50/70；100 = 只看竖屏。
     /// 网页推荐里竖屏偏少，按比例从拉到的视频里挑；多出来的先放进候选池，下次直接用，不浪费。
     @AppStorage("douyin_portrait_ratio_v1") var portraitRatio = 70
+    /// 竖屏播放时「短视频」的目标占比（0–100）
+    @AppStorage("douyin_short_ratio_portrait_v1") var shortRatioPortrait = 70
+    /// 横屏播放时「短视频」的目标占比（0–100）
+    @AppStorage("douyin_short_ratio_landscape_v1") var shortRatioLandscape = 70
     /// 横着看（屏幕/播放区比高宽）时只放横屏视频
     @AppStorage("douyin_wide_landscape_v1") var landscapeWhenWide = true
     /// 视频比屏幕窄（左右黑边）时自动放大铺满宽度；菜单里可关
@@ -844,6 +848,9 @@ final class DYFeedModel: ObservableObject {
     var pool: [DYAweme] = []
     static let poolCap = 80
     private var mixCredit: Double = 0
+    private var shortCredit: Double = 0
+    /// 短视频判定：3 分钟内（网页推荐里 60 秒内的几乎为 0，用 3 分钟才凑得出占比）
+    static func isShort(_ a: DYAweme) -> Bool { a.duration > 0 && a.duration <= 180 }
 
     init() {
         // 旧版「只看竖屏」开着的，迁移成 100%
@@ -863,10 +870,12 @@ final class DYFeedModel: ObservableObject {
 
     var mixLabel: String {
         if screenWide && landscapeWhenWide { return "横屏中：只放横屏" }
+        let short = screenWide ? shortRatioLandscape : shortRatioPortrait
+        let shortText = short < 0 ? "短视频不限" : (short >= 100 ? "只短视频" : "短视频 \(short)%")
         switch portraitRatio {
-        case ..<0: return "不限"
-        case 100...: return "只看竖屏"
-        default: return "竖屏 \(portraitRatio)%"
+        case ..<0: return "竖横不限 · \(shortText)"
+        case 100...: return "只看竖屏 · \(shortText)"
+        default: return "竖屏 \(portraitRatio)% · \(shortText)"
         }
     }
 
@@ -880,7 +889,7 @@ final class DYFeedModel: ObservableObject {
             if let r = targetRatio, !relaxed {
                 // 均匀穿插（类似 Bresenham）：每条攒 r 份「竖屏额度」，满 1 份就放竖屏，例如 70% → 竖横竖竖横竖竖…
                 wantPortrait = r >= 1 ? true : r <= 0 ? false : (mixCredit + r >= 1)
-                idx = pool.firstIndex { Self.isPortrait($0) == wantPortrait! }
+                idx = pickIndex(wantPortrait: wantPortrait!, wantShort: wantedShort())
             } else {
                 idx = 0
             }
@@ -890,9 +899,38 @@ final class DYFeedModel: ObservableObject {
             if let r = targetRatio, r > 0, r < 1 {
                 mixCredit = (mixCredit + r - (Self.isPortrait(a) ? 1 : 0)).clamped(-1, 1)
             }
+            let pct = screenWide ? shortRatioLandscape : shortRatioPortrait
+            if pct > 0, pct < 100 {
+                let sr = Double(pct) / 100
+                shortCredit = (shortCredit + sr - (Self.isShort(a) ? 1 : 0)).clamped(-1, 1)
+            }
             n += 1
         }
         return n
+    }
+
+    /// 竖屏优先短视频、横屏优先长视频：只在同方向的候选里、前 8 条内挑，
+    /// 不会把推荐顺序整体打乱（网页推荐里 60 秒以下几乎没有，竖屏也常是中长视频）。
+    /// 当前方向下这一条要不要短视频（按设置比例均匀穿插）
+    private func wantedShort() -> Bool? {
+        let pct = screenWide ? shortRatioLandscape : shortRatioPortrait
+        guard pct >= 0, pct <= 100 else { return nil }
+        if pct >= 100 { return true }
+        if pct <= 0 { return false }
+        let r = Double(pct) / 100
+        return shortCredit + r >= 1
+    }
+
+    private func pickIndex(wantPortrait: Bool, wantShort: Bool?) -> Int? {
+        let matches = pool.indices.filter { Self.isPortrait(pool[$0]) == wantPortrait }
+        guard let first = matches.first else { return nil }
+        if let wantShort {
+            // 先找「方向 + 长短」都符合的；凑不到就退到只按方向挑（别让列表断粮）
+            let window = Array(matches.prefix(24))
+            if let i = window.first(where: { Self.isShort(pool[$0]) == wantShort }) { return i }
+            return first
+        }
+        return first
     }
 
     /// 方向 / 比例变了：当前条之后的重新按比例排（当前这条不动，不打断播放）
@@ -903,6 +941,7 @@ final class DYFeedModel: ObservableObject {
         items.removeSubrange(keep...)
         pool = upcoming + pool
         mixCredit = 0
+        shortCredit = 0
         fill(max(upcoming.count, 6))
         trimPool()
     }
@@ -955,7 +994,7 @@ final class DYFeedModel: ObservableObject {
         }
     }
 
-    func reset() { items = []; hasMore = true; error = nil; pool = []; mixCredit = 0 }
+    func reset() { items = []; hasMore = true; error = nil; pool = []; mixCredit = 0; shortCredit = 0 }
 }
 
 struct DouyinFeedScreen: View {
@@ -1018,6 +1057,7 @@ struct DouyinFeedScreen: View {
             if ProcessInfo.processInfo.environment["DOUDUO_SELFTEST"] == "1" { Task { await DDSelfTest.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_APITEST"] == "1" { Task { await DDApiProbe.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_LIVEPROBE"] == "1" { Task { await DDFeatureProbe.run(bridge, live: live) } }
+            if ProcessInfo.processInfo.environment["DOUDUO_EXPORTTEST"] == "1" { Task { await DDFeatureProbe.exportHeadProbe(bridge) } }
             #endif
             if tab == .live { return }   // 起手就是直播页（调试）时别把推荐流的播放器都拉起来
             // 秒开：先播上次缓存好、还没看过的；连接抖音 / 拉推荐在后台接着往后补
@@ -1103,6 +1143,8 @@ struct DouyinFeedScreen: View {
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .onChange(of: feed.portraitRatio) { _, _ in remixUpcoming() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
+        .onChange(of: feed.shortRatioPortrait) { _, _ in remixUpcoming() }
+        .onChange(of: feed.shortRatioLandscape) { _, _ in remixUpcoming() }
         .onDisappear { live.stop(); preloader.clear() }
         .fullScreenCover(item: $web, onDismiss: {
             // 网页里可能登录 / 过了验证：重开签名页，先重新读登录态，再刷推荐
@@ -1323,12 +1365,10 @@ struct DouyinFeedScreen: View {
         preloader.update(feed.items, current: i)
         let curID = feed.items[i].id
         let ahead = Array(feed.items.dropFirst(i + 1))
+        let currentItem = feed.items[i]
         Task {
             await DYVideoCache.shared.markWatched(curID)
-            // 整条下载晚 1.5 秒再排：让刚滑到的这条先把开头缓冲好；期间又滑走了就交给下一次
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard currentID == curID else { return }
-            await DYVideoCache.shared.enqueue(ahead)
+            await DYVideoCache.shared.focus(current: currentItem, ahead: ahead)
         }
         // 后面不足「缓存条数」就继续拉推荐（至少保证 6 条，节流 4 秒一次）
         let want = max(6, min(DYVideoCache.limit, 60))
@@ -1338,7 +1378,7 @@ struct DouyinFeedScreen: View {
                 await feed.loadMore(bridge)
                 if let j = currentIndex {
                     preloader.update(feed.items, current: j)
-                    await DYVideoCache.shared.enqueue(Array(feed.items.dropFirst(j + 1)))
+                    await DYVideoCache.shared.focus(current: feed.items[j], ahead: Array(feed.items.dropFirst(j + 1)))
                     if feed.items.count - j - 1 < want { focusCurrent() }
                 }
             }
@@ -1703,7 +1743,26 @@ struct DouyinFeedScreen: View {
             Button { showMine = true } label: { Label("我的", systemImage: "person.crop.circle") }
                 .accessibilityIdentifier("douyin.mine")
             Menu {
-                Toggle(isOn: $feed.landscapeWhenWide) { Label("横着看时只放横屏", systemImage: "rectangle") }
+                Picker(selection: $feed.shortRatioPortrait) {
+                    Text("不限").tag(-1)
+                    Text("短视频 30%").tag(30)
+                    Text("短视频 50%").tag(50)
+                    Text("短视频 70%").tag(70)
+                    Text("只看短视频").tag(100)
+                } label: { Label("竖屏短视频占比（3 分钟内）", systemImage: "rectangle.portrait") }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("douyin.short.portrait")
+                Picker(selection: $feed.shortRatioLandscape) {
+                    Text("不限").tag(-1)
+                    Text("短视频 30%").tag(30)
+                    Text("短视频 50%").tag(50)
+                    Text("短视频 70%").tag(70)
+                    Text("只看短视频").tag(100)
+                } label: { Label("横屏短视频占比（3 分钟内）", systemImage: "rectangle") }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("douyin.short.landscape")
+                Toggle(isOn: $feed.landscapeWhenWide) { Label("横屏时只放横屏内容", systemImage: "rectangle.on.rectangle") }
+                    .accessibilityIdentifier("douyin.landscape.only")
                 Toggle(isOn: $feed.autoFit) { Label("自动铺满宽度", systemImage: "arrow.up.left.and.arrow.down.right") }
                 Picker(selection: $cacheCount) {
                     Text("关闭").tag(0)
@@ -1810,7 +1869,10 @@ struct DYVideoPage: View {
         let fg = theme.media.onMedia.color(for: scheme)
         ZStack(alignment: .bottomLeading) {
             if item.images.isEmpty, let s = item.play, let remote = URL(string: s) {
-                let url = DYVideoCache.localURL(item.id) ?? remote
+                let full = DYVideoCache.localURL(item.id)
+                let head = full == nil ? DYVideoCache.headFile(item.id) : nil
+                let headSecs = head == nil ? nil : DYVideoCache.headPlayableSeconds(item.id)
+                let url = full ?? head ?? remote
                 // 复用影库播放器：横滑快进（带预览缩略图）、双击、长按 2 倍速、竖滑切视频、底部可拖进度条、VLC 兜底
                 PlayerPage.external(id: item.id, title: item.desc, url: url, durationSec: item.duration,
                                     isActive: isCurrent, topInset: insets.top, bottomInset: insets.bottom,
@@ -1828,7 +1890,9 @@ struct DYVideoPage: View {
                                     quality: item.q,
                                     fastURL: item.playFast.flatMap(URL.init(string:)),
                                     posterURL: item.cover.flatMap(URL.init(string:)),
-                                    videoAspect: item.height > 0 ? item.width / item.height : 0)
+                                    videoAspect: item.height > 0 ? item.width / item.height : 0,
+                                    headEndSeconds: headSecs,
+                                    continuationURL: head == nil ? nil : remote)
             } else {
                 TabView {
                     ForEach(item.images, id: \.self) { s in

@@ -118,6 +118,26 @@ final class DouDuoUITests: XCTestCase {
         }
     }
 
+    /// 头部缓存起播：先让当前条缓存 + 预取后面 2 条，再上滑看是否本地起播并在安全点切回在线
+    func testHeadCachePlayback() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let current = app.staticTexts["douyin.currentID"]
+        XCTAssertTrue(current.waitForExistence(timeout: 30))
+        let loaded = expectation(for: NSPredicate(format: "label != '-'"), evaluatedWith: current)
+        XCTAssertEqual(XCTWaiter().wait(for: [loaded], timeout: 60), .completed)
+        sleep(16)  // 当前条整条缓存 + 后面 2 条头部预取（等落盘完成再切）
+        let first = current.label
+        app.swipeUp(velocity: .fast)
+        let changed = expectation(for: NSPredicate(format: "label != %@", first), evaluatedWith: current)
+        XCTAssertEqual(XCTWaiter().wait(for: [changed], timeout: 15), .completed, "上滑没切条")
+        // 进度文字在紧凑模式下不一定暴露给 XCUI，这里以 ddlog 的 DDSTART local=true / DDHEAD continue 为准
+        sleep(4)
+        attach(app, "head-cache-play")
+        sleep(14)  // 跨过 headPlayableSeconds，验证续播不卡死
+        attach(app, "head-cache-continued")
+    }
+
     func testConditionalTitleExpansion() throws {
         let app = XCUIApplication()
         app.launchEnvironment["DOUDUO_TITLETEST"] = "1"

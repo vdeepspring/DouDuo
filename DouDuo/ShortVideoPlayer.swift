@@ -81,12 +81,14 @@ extension PlayerPage {
                          onSavePosition: @escaping (Double) -> Void, onClose: @escaping () -> Void,
                          fillWidth: Bool = true, danmaku: [DYDanmaku] = [], altURL: URL? = nil,
                          quality: String? = nil, fastURL: URL? = nil, posterURL: URL? = nil,
-                         videoAspect: Double = 0) -> PlayerPage {
+                         videoAspect: Double = 0,
+                         headEndSeconds: Double? = nil, continuationURL: URL? = nil) -> PlayerPage {
         PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
                    resumePosition: resumePosition, preparedPlayer: preparedPlayer, onEnded: onEnded,
                    onDoubleTap: onDoubleTap, onSavePosition: onSavePosition, fillWidth: fillWidth,
                    topInset: topInset, danmaku: danmaku, altURL: altURL, quality: quality, fastURL: fastURL,
-                   posterURL: posterURL, videoAspect: videoAspect)
+                   posterURL: posterURL, headEndSeconds: headEndSeconds,
+                   continuationURL: continuationURL, videoAspect: videoAspect)
     }
 }
 
@@ -114,6 +116,12 @@ struct PlayerPage: View {
     var fastURL: URL? = nil
     /// 封面：首帧出来前先显示（网格里已经缓存过，点进来立刻有画面，不是黑屏转圈）
     var posterURL: URL? = nil
+    /// 本地「头部缓存」能安全播到的秒数：播到这里就用 continuationURL 接上在线流，
+    /// 不能让 AVPlayer 冲到没数据的尾部（那样会卡住而不是 ended）
+    var headEndSeconds: Double? = nil
+    /// 头部缓存播完后继续播的在线地址（一次性）
+    var continuationURL: URL? = nil
+    @State private var continued = false
     @State private var firstFrame = false
     /// 视频画面宽高比（海报占位用同一套铺满规则，避免「先小后跳」）
     var videoAspect: Double = 0
@@ -372,6 +380,36 @@ struct PlayerPage: View {
 
     // MARK: 播放
 
+    /// 头部缓存文件：把播放终点钉在安全位置，播到这里会正常 ended，而不是卡在没数据的尾部
+    private func makeItem(asset: AVAsset) -> AVPlayerItem {
+        let item = AVPlayerItem(asset: asset)
+        if let h = headEndSeconds, h > 0 {
+            item.forwardPlaybackEndTime = CMTime(seconds: h, preferredTimescale: 600)
+        }
+        return item
+    }
+
+    /// 头部缓存播完 → 用在线流从同一时间点接上（一次性；接上后不再触发）
+    @discardableResult
+    private func continueFromRemote(_ p: AVPlayer) -> Bool {
+        guard !continued, let remote = continuationURL else { return false }
+        continued = true
+        let start = headEndSeconds ?? p.currentTime().seconds
+        #if DEBUG
+        ddWrite("DDHEAD continue remote at \(String(format: "%.1f", start))")
+        #endif
+        teardownPlayerOnly()
+        let np = AVPlayer(playerItem: AVPlayerItem(asset: DYMedia.asset(remote)))
+        np.automaticallyWaitsToMinimizeStalling = true
+        player = np
+        attachObservers(np)
+        np.isMuted = muted
+        np.seek(to: CMTime(seconds: start, preferredTimescale: 600)) { _ in np.play() }
+        isPlaying = true
+        watchdog(np)
+        return true
+    }
+
     private func setup() {
         #if DEBUG
         if ProcessInfo.processInfo.environment["DOUDUO_FORCE_VLC"] == "1" {
@@ -385,7 +423,10 @@ struct PlayerPage: View {
         let preBuf = pre?.currentItem?.loadedTimeRanges.first.map { CMTimeGetSeconds($0.timeRangeValue.duration) } ?? 0
         #endif
         let asset = (pre?.currentItem?.asset as? AVURLAsset) ?? DYMedia.asset(url)
-        let p = pre ?? AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        let p = pre ?? AVPlayer(playerItem: makeItem(asset: asset))
+        if let pre, let h = headEndSeconds, pre.currentItem?.forwardPlaybackEndTime.seconds ?? 0 <= 0 {
+            pre.currentItem?.forwardPlaybackEndTime = CMTime(seconds: h, preferredTimescale: 600)
+        }
         p.automaticallyWaitsToMinimizeStalling = true
         player = p
         if knownDuration > 0 { duration = knownDuration }
@@ -588,7 +629,7 @@ struct PlayerPage: View {
         #if DEBUG
         ddWrite("DDREBUILD \(id) alt=\(altURL != nil)")
         #endif
-        let item = AVPlayerItem(asset: DYMedia.asset(altURL ?? url))
+        let item = makeItem(asset: DYMedia.asset(altURL ?? url))
         let p = AVPlayer(playerItem: item)
         p.automaticallyWaitsToMinimizeStalling = true
         if rateLocked { p.defaultRate = 2 }   // 重建播放项也保持已锁定的 2 倍速
@@ -682,6 +723,7 @@ struct PlayerPage: View {
         endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,
                                                              object: p.currentItem, queue: .main) { _ in
             MainActor.assumeIsolated {
+                if continueFromRemote(p) { return }
                 if let onEnded { onEnded() } else { p.seek(to: .zero); p.play() }   // 抖音同款：单条循环
             }
         }

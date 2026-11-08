@@ -72,7 +72,7 @@ final class DouDuoUITests: XCTestCase {
         XCTAssertTrue(enter.isHittable)
         let id = app.staticTexts["live.currentID"].label
         enter.tap()
-        XCTAssertTrue(app.buttons["live.room.close"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["live.room.back"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.textFields["live.chat.input"].exists)
         XCTAssertFalse(app.buttons["live.categories"].exists, "进房后不显示首页分类按钮")
         XCTAssertFalse(app.buttons["douyin.web.close"].exists, "进房不能打开网页版播放器")
@@ -81,7 +81,7 @@ final class DouDuoUITests: XCTestCase {
         app.buttons["清屏"].tap()
         XCTAssertTrue(app.buttons["live.room.restore"].waitForExistence(timeout: 5))
         app.buttons["live.room.restore"].tap()
-        app.buttons["live.room.close"].tap()
+        app.buttons["live.room.back"].tap()
         XCTAssertTrue(categories.waitForExistence(timeout: 5))
         XCTAssertEqual(app.staticTexts["live.currentID"].label, id, "退房应回到同一个直播预览")
         attach(app, "live-preview-return")

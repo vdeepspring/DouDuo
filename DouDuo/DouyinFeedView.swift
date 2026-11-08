@@ -1349,7 +1349,7 @@ struct DouyinFeedScreen: View {
     private var feedArea: some View {
         ZStack(alignment: .top) {
             if tab == .live {
-                DYLiveFeed(bridge: bridge, model: live, onWeb: { u in web = DYWebTarget(url: u) }, active: web == nil)
+                DYLiveFeed(bridge: bridge, model: live, onWeb: { u in web = DYWebTarget(url: u) }, active: web == nil, topInset: insets.top)
             } else if tab == .follow {
                 DYFollowFeed(bridge: bridge, insets: insets, active: tab == .follow && web == nil && !showSearch && !showMine && authorTarget == nil,
                              onAuthor: { a in authorTarget = a.author },

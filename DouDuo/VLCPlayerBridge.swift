@@ -102,7 +102,7 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
 
     /// 设 media 但**不立即 play**——必须等 VLCPlayerSurface 把 drawable 挂上后
     /// 再由 drawableAttached() 触发，否则 VLC 解码无视频输出目标 → 有声无画。
-    func play(url: URL, autoplay: Bool = true, headers: [String: String] = [:], cachingMs: Int32 = 1500) {
+    func play(url: URL, autoplay: Bool = true, headers: [String: String] = [:], cachingMs: Int32 = 1500, extraOptions: [String] = []) {
         let media = VLCMedia(url: url)
         // 抖音 CDN 不带浏览器 UA + Referer 会 403
         if let ua = headers["User-Agent"] { media.addOption(":http-user-agent=\(ua)") }
@@ -112,6 +112,7 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
         media.addOption(":codec=videotoolbox,avcodec")
         media.addOption(":network-caching=\(cachingMs)")
         media.addOption(":live-caching=\(cachingMs)")
+        extraOptions.forEach { media.addOption($0) }
         // 换视频必须清掉上个流的进度/尺寸，否则单调防抖会把新流前几十秒都吞掉。
         lastReported = 0; seekTarget = nil; current = 0; duration = 0; videoSize = .zero
         mediaPlayer.media = media

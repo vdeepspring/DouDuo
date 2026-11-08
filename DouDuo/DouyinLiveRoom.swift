@@ -7,6 +7,50 @@ struct DYLiveStream: Hashable {
     let quality: String
     let isFLV: Bool
     var cacheMS: Int32 { isFLV ? 800 : 1500 }
+    /// 起播超时：真机 FLV 正常 0.6–2.8s 出画，4s 还没画面多半是这条线路卡在边缘，早点换下一条
+    var startupTimeout: Double { isFLV ? 4 : 8 }
+    /// 连接直播的大头不是网络缓存，而是 VLC 的探测：
+    /// - FLV 走 libavformat，默认 analyzeduration 5s / probesize 5MB，直播流要攒够才出画 → 限到 1s / 512KB
+    /// - HLS 走 adaptive，默认 livedelay 15s，起播要先把 15s 前的若干分片都拉下来 → 收到 6s
+    var vlcOptions: [String] {
+        isFLV
+            ? [":avformat-options={analyzeduration=1000000,probesize=524288}", ":http-reconnect"]
+            : [":adaptive-livedelay=6000"]
+    }
+}
+
+/// 预热下一间直播的 CDN 边缘：DNS/TLS 先连上，边缘节点先开始回源拉流；真正切过去时 VLC 首包更快。
+/// 只读几十 KB 就断开，不占带宽。
+enum DYLiveWarmer {
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 4
+        c.httpMaximumConnectionsPerHost = 2
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: c)
+    }()
+
+    static func warm(_ stream: DYLiveStream) async {
+        var req = URLRequest(url: stream.url)
+        DYMedia.liveHeaders.forEach { req.setValue($1, forHTTPHeaderField: $0) }
+        let start = ProcessInfo.processInfo.systemUptime
+        var got = 0
+        do {
+            if stream.isFLV {
+                let (bytes, _) = try await session.bytes(for: req)
+                var buf = 0
+                for try await _ in bytes {
+                    buf += 1
+                    if buf >= 48 * 1024 || Task.isCancelled { break }
+                }
+                got = buf
+            } else {
+                let (data, _) = try await session.data(for: req)
+                got = data.count
+            }
+        } catch {}
+        DYLiveModel.log("DDLIVE_WARM protocol=\(stream.isFLV ? "FLV" : "HLS") bytes=\(got) elapsed=\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime - start))")
+    }
 }
 
 extension DYLiveRoom {
@@ -51,6 +95,8 @@ final class DYLiveModel: ObservableObject {
     private var roomRef: DYLiveRoom?
     private var sources: [DYLiveStream] = []
     private var retryTask: Task<Void, Never>?
+    private var warmTask: Task<Void, Never>?
+    private var warmedRooms = Set<String>()
     private var startedAt = ProcessInfo.processInfo.systemUptime
     private var streamGeneration = UUID()
     private let lifecycleID = UUID()
@@ -83,6 +129,7 @@ final class DYLiveModel: ObservableObject {
             self.ready = true
             self.retryTask?.cancel()
             Self.log("DDLIVE_READY room=\(self.loadedRoom ?? "-") elapsed=\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime - self.startedAt)) videoOut=true")
+            self.prewarmNext()
         }
         vlc.onError = { [weak self] in self?.tryNextSource(reason: "decoder/network error") }
         vlc.onEnd = { [weak self] in self?.playbackError = "直播已结束或连接中断，可重试或上滑换台" }
@@ -110,6 +157,40 @@ final class DYLiveModel: ObservableObject {
         }
     }
 
+    /// 列表过期但没过太久：先用手上的列表立刻起播，再在后台换新列表（当前这间保持不动、不断流）。
+    /// 以前超过 60s 就清空重拉，冷启动实测列表要等 ~7s，加上拉流就是十几秒「连接直播…」。
+    func refreshInBackground(_ bridge: DouyinBridge) async {
+        guard !loading, zone == nil else { return }
+        let generation = requestGeneration, keep = currentID
+        loading = true
+        defer { if requestGeneration == generation { loading = false } }
+        guard let fresh = try? await bridge.fetchLive(reset: true, zone: nil), !fresh.isEmpty,
+              requestGeneration == generation, zone == nil else { return }
+        var merged = rooms.filter { $0.id == keep }
+        var seen = Set(merged.map(\.id))
+        merged.append(contentsOf: fresh.filter { seen.insert($0.id).inserted })
+        rooms = merged
+        if currentID == nil { currentID = rooms.first?.id }
+        fetchedAt = Date(); error = nil
+        warmedRooms.removeAll()
+        if ready { prewarmNext() }
+        Self.log("DDLIVE_FEED_BG count=\(fresh.count) kept=\(keep ?? "-")")
+    }
+
+    private func prewarmNext() {
+        guard let id = loadedRoom, let i = rooms.firstIndex(where: { $0.id == id }) else { return }
+        let next = rooms.dropFirst(i + 1).prefix(1).filter { !warmedRooms.contains($0.id) }
+        guard !next.isEmpty else { return }
+        next.forEach { warmedRooms.insert($0.id) }
+        let streams = next.compactMap { $0.liveStreams.first }
+        warmTask?.cancel()
+        warmTask = Task.detached(priority: .utility) {
+            // 等当前这间稳定出画、首段缓冲走完再预热，别跟它抢带宽
+            try? await Task.sleep(for: .milliseconds(800))
+            for s in streams where !Task.isCancelled { await DYLiveWarmer.warm(s) }
+        }
+    }
+
     func play(_ room: DYLiveRoom?) {
         guard let room else { return }
         if loadedRoom == room.id, vlc.mediaPlayer.media != nil { return }
@@ -130,11 +211,12 @@ final class DYLiveModel: ObservableObject {
             playbackError = "没有可用直播线路，请重试或换一个直播间"; return
         }
         startedAt = ProcessInfo.processInfo.systemUptime
-        vlc.play(url: source.url, headers: DYMedia.liveHeaders, cachingMs: source.cacheMS)
+        warmTask?.cancel()
+        vlc.play(url: source.url, headers: DYMedia.liveHeaders, cachingMs: source.cacheMS, extraOptions: source.vlcOptions)
         vlc.mediaPlayer.audio?.isMuted = muted
         Self.log("DDLIVEPLAY room=\(loadedRoom ?? "-") protocol=\(source.isFLV ? "FLV" : "HLS") q=\(source.quality) cache=\(source.cacheMS) drawable=\(vlc.mediaPlayer.drawable != nil)")
         retryTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(source.isFLV ? 6 : 10)) } catch { return }
+            do { try await Task.sleep(for: .seconds(source.startupTimeout)) } catch { return }
             guard let self, self.streamGeneration == generation, !self.ready else { return }
             self.tryNextSource(reason: "startup timeout")
         }
@@ -164,7 +246,7 @@ final class DYLiveModel: ObservableObject {
         Self.log("DDLIVE_LEAVE room=\(currentID ?? "-") reused=true")
     }
     func stop() {
-        retryTask?.cancel(); streamGeneration = UUID()
+        retryTask?.cancel(); warmTask?.cancel(); streamGeneration = UUID()
         loadedRoom = nil; vlc.stop(); ready = false
     }
     func reset() {
@@ -191,6 +273,8 @@ struct DYLiveFeed: View {
     @ObservedObject var model: DYLiveModel
     let onWeb: (URL) -> Void
     var active = true
+    /// 系统状态栏高度（外层整块忽略了顶部安全区，这里拿不到，由外层传入）
+    var topInset: CGFloat = 0
     /// ⚠️ 不直接 @StateObject DYLiveChat：热门直播间每秒都有新弹幕，会让整页（ScrollView + VLC 渲染层）跟着重算 → 卡。
     /// 包一层不发通知的盒子，只让聊天浮层自己订阅
     @StateObject private var chatBox = DYLiveChatBox()
@@ -247,11 +331,14 @@ struct DYLiveFeed: View {
             if value { model.activate() } else { model.deactivate() }
         }
         .task {
-            if model.rooms.isEmpty || Date().timeIntervalSince(model.fetchedAt) > 60 {
+            let age = Date().timeIntervalSince(model.fetchedAt)
+            // 超过 10 分钟的列表线路签名/开播状态都不可靠，才整页重拉；1–10 分钟先播、后台换新
+            if model.rooms.isEmpty || age > 600 {
                 await model.load(bridge, reset: true)
             }
             scrollID = model.currentID
             model.play(currentRoom)
+            if age > 60 && age <= 600 { await model.refreshInBackground(bridge) }
         }
         .onChange(of: model.currentID) { _, id in
             if let id, scrollID != id { scrollID = id }
@@ -312,7 +399,7 @@ struct DYLiveFeed: View {
         ScrollView(.vertical) {
             LazyVStack(spacing: 0) {
                 ForEach(model.rooms) { room in
-                    DYLiveRoomPage(room: room, model: model, isCurrent: model.currentID == room.id,
+                    DYLiveRoomPage(room: room, model: model, isCurrent: model.currentID == room.id, topInset: topInset,
                                    chat: model.currentID == room.id ? chat : nil,
                                    input: AnyView(commentInput), onWeb: onWeb)
                         .containerRelativeFrame([.horizontal, .vertical])
@@ -392,11 +479,14 @@ private struct DYLiveRoomPage: View {
     let room: DYLiveRoom
     @ObservedObject var model: DYLiveModel
     let isCurrent: Bool
+    let topInset: CGFloat
     /// 只有当前房间传；浮层自己订阅新消息，不让整页重算
     let chat: DYLiveChat?
     let input: AnyView
     let onWeb: (URL) -> Void
     private var foreground: Color { theme.media.onMedia.color(for: scheme) }
+    /// 顶部控件放在系统状态栏下方：按实际状态栏高度 + 8pt，至少保留原来的 64/70
+    private var chromeTop: CGFloat { max(topInset + 8, hSize == .compact ? 64 : 70) }
 
     var body: some View {
         GeometryReader { geo in
@@ -426,7 +516,7 @@ private struct DYLiveRoomPage: View {
                     VStack { HStack { Spacer(); circle("arrow.uturn.backward", id: "live.room.restore") { model.clean = false } }; Spacer() }
                         .contentShape(Rectangle())
                         .onTapGesture { model.clean = false }
-                        .padding(.leading, 18).padding(.trailing, hSize == .compact ? 82 : 18).padding(.top, hSize == .compact ? 64 : 70)
+                        .padding(.leading, 18).padding(.trailing, hSize == .compact ? 82 : 18).padding(.top, chromeTop)
                 } else if model.entered {
                     VStack {
                         header
@@ -449,7 +539,7 @@ private struct DYLiveRoomPage: View {
                     }
                     .padding(.leading, 18)
                     .padding(.trailing, hSize == .compact ? 82 : 18)
-                    .padding(.top, hSize == .compact ? 64 : 70)
+                    .padding(.top, chromeTop)
                     .padding(.bottom, max(geo.safeAreaInsets.bottom, 12) + 12)
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
@@ -487,7 +577,10 @@ private struct DYLiveRoomPage: View {
             .frame(width: 36, height: 36).clipShape(Circle())
     }
     private var header: some View {
+        // 返回按钮在左、紧挨主播信息，位于状态栏下方（不再是右上角贴着状态栏的 ✕）
         HStack(spacing: 10) {
+            circle("chevron.backward", id: "live.room.back", action: model.leaveRoom)
+                .accessibilityLabel("返回")
             HStack(spacing: 8) {
                 avatar
                 VStack(alignment: .leading, spacing: 2) {
@@ -496,7 +589,6 @@ private struct DYLiveRoomPage: View {
                 }
             }.padding(.trailing, 12).padding(.leading, 4).padding(.vertical, 4).ddGlassCapsule()
             Spacer(minLength: 8)
-            circle("xmark", id: "live.room.close", action: model.leaveRoom)
         }
     }
     private func circle(_ name: String, id: String, action: @escaping () -> Void) -> some View {

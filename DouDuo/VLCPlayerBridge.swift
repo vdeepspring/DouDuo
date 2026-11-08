@@ -17,6 +17,10 @@ struct VLCPlayerSurface: UIViewRepresentable {
         controller.drawableAttached()   // drawable 就绪后才真正 play，避免「有声无画」
         return v
     }
+    /// 页面被拆掉时把 drawable 摘掉：直播切房间后旧页的视图已离屏，不能让新流画到它上面
+    static func dismantleUIView(_ uiView: VLCPlayerUIView, coordinator: ()) {
+        if let c = uiView.controller, c.mediaPlayer.drawable as? UIView === uiView { c.mediaPlayer.drawable = nil }
+    }
     func updateUIView(_ uiView: VLCPlayerUIView, context: Context) {
         // ⚠️ 不要每次 updateUIView 都重设 drawable（@State 0.25s 变一次会反复触发，
         // 频繁 attach/detach 视频输出 → 画面冻结）。仅在 drawable 丢失时补挂。
@@ -72,6 +76,7 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
 
     var onProgress: ((Double) -> Void)?
     var onEnd: (() -> Void)?
+    var onError: (() -> Void)?
     private var seekTarget: Double?       // seek 后短暂屏蔽回调防抖
     private var lastReported: Double = 0  // 上次回调值，防回退抖动
     private var pendingURL: URL?          // 等 drawable 就绪再 play
@@ -107,6 +112,8 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
         media.addOption(":codec=videotoolbox,avcodec")
         media.addOption(":network-caching=\(cachingMs)")
         media.addOption(":live-caching=\(cachingMs)")
+        // 换视频必须清掉上个流的进度/尺寸，否则单调防抖会把新流前几十秒都吞掉。
+        lastReported = 0; seekTarget = nil; current = 0; duration = 0; videoSize = .zero
         mediaPlayer.media = media
         pendingURL = url
         pendingAutoplay = autoplay
@@ -127,8 +134,8 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
                 mediaPlayer.play()
                 isPlaying = true
             }
-        } else if isPlaying && !mediaPlayer.isPlaying {
-            // drawable 丢失后重挂 → 恢复渲染
+        } else if isPlaying && [.stopped, .paused, .ended, .error].contains(mediaPlayer.state) {
+            // drawable 丢失后重挂 → 恢复渲染。正在打开/缓冲时别再 play：直播切房间时会把刚起的流打断
             mediaPlayer.play()
         }
     }
@@ -171,6 +178,7 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
     }
 
     func stop() {
+        pendingURL = nil; pendingAutoplay = false
         mediaPlayer.stop()
         isPlaying = false
     }
@@ -178,6 +186,7 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
     // VLCMediaPlayerDelegate
     nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification) {
         Task { @MainActor in
+            guard mediaPlayer.isPlaying else { return }
             let raw = Double(mediaPlayer.time.intValue) / 1000.0
             let dur = mediaPlayer.media?.length.intValue ?? 0
             if dur > 0 { duration = Double(dur) / 1000.0 }
@@ -207,9 +216,15 @@ final class VLCPlayerController: NSObject, VLCMediaPlayerDelegate, ObservableObj
                 }
             case .paused:
                 isPlaying = false
-            case .stopped, .ended, .error:
+            case .ended:
                 isPlaying = false
                 onEnd?()
+            case .error:
+                isPlaying = false
+                onError?()
+            case .stopped:
+                // stop()/换流不是自然播完，不能触发自动下一条或循环回调。
+                isPlaying = false
             default:
                 break
             }

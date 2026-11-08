@@ -2,72 +2,10 @@
 // iOS 27.1 用 ArrangementView.overlay（书本：视频 leading、评论 trailing；桌面：视频在上、评论在下）。
 // 更低版本回退容器宽度 wide>=700，不读方向、不读 UIScreen。
 import SwiftUI
-import UIKit
 
 enum DYDuoMetrics {
     /// iOS 17–27.0 的宽屏回退，和改版前同一条线。
     static let legacyWideMin: CGFloat = 700
-
-    /// 右侧按钮栏宽度（actions 里 .frame(width: 54)），和下面的「…」按钮同一条中线
-    static let railWidth: CGFloat = 54
-    /// 读不到摄像头预留区域时（内屏、iOS 27.1 以下、外屏倒拿摄像头在左）的右边距
-    static let railDefaultTrailing: CGFloat = 12
-
-    /// 右侧按钮栏右边距。HIG（Designing for iPhone Duo）：侧边那一列从上到下是「摄像头 / 状态栏 / 工具栏 / 标签栏」，
-    /// 按钮栏要和状态栏同一条中线。按可靠程度依次取：
-    /// 1. 系统状态栏的实际位置（竖排在右侧时，statusBarFrame 是一条竖条）——直接对准它
-    /// 2. 外屏摄像头的 occlusion 预留区域
-    /// 3. 右侧有系统侧边栏（右安全区 ≥ 44）但前两项都拿不到：用真机截图量出的中线（离右缘约 48pt）
-    /// 4. 都没有（内屏平放 / 老系统）：默认 12pt
-    static func railTrailing(_ proxy: GeometryProxy, safeTrailing: CGFloat) -> CGFloat {
-        let w = proxy.size.width
-        guard w > 1 else { return railDefaultTrailing }
-        let page = proxy.frame(in: .global)
-        var how = "default"
-        var result = railDefaultTrailing
-        if let sb = statusBarFrame(), sb.height > sb.width, sb.width > 10, sb.midX > page.midX {
-            result = page.maxX - sb.midX - railWidth / 2
-            how = "statusBar \(sb)"
-        } else if let cam = outerCamera(proxy) {
-            result = w - cam.midX - railWidth / 2
-            how = "occlusion \(cam)"
-        } else if safeTrailing >= 44 {
-            result = sideColumnCenterFromEdge - railWidth / 2
-            how = "sideInset \(safeTrailing)"
-        }
-        result = min(max(0, result), w / 3)
-        logOnce("DDRAIL w=\(Int(w)) page=\(page.integral) safeR=\(safeTrailing) sb=\(statusBarFrame().map { "\($0.integral)" } ?? "nil") via=\(how) -> \(String(format: "%.1f", result))")
-        return result
-    }
-
-    /// 真机外屏截图实测：状态栏那一列中线离右缘约 48pt（只在拿不到系统位置时兜底用）
-    static let sideColumnCenterFromEdge: CGFloat = 48
-
-    private static func statusBarFrame() -> CGRect? {
-        let scene = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first { $0.activationState == .foregroundActive } ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
-        guard let f = scene?.statusBarManager?.statusBarFrame, f.width > 1, f.height > 1,
-              scene?.statusBarManager?.isStatusBarHidden == false else { return nil }
-        return f
-    }
-
-    private static func outerCamera(_ proxy: GeometryProxy) -> CGRect? {
-        if #available(iOS 27.1, *) {
-            let w = proxy.size.width
-            return proxy.reservedRegions(kind: .occlusion)
-                .filter { r in r.isActive && r.frame.width > 1 && w - r.frame.midX < 120 && w - r.frame.midX > railWidth / 2 }
-                .min(by: { $0.frame.minY < $1.frame.minY })?.frame
-        }
-        return nil
-    }
-
-    private static var lastLog = ""
-    private static func logOnce(_ s: String) {
-        guard s != lastLog else { return }
-        lastLog = s
-        DYLiveModel.log(s)
-    }
 
     /// 折痕是否处于激活状态（半折叠）。iOS 27.1 以下恒为 false。
     static func foldIsActive(_ proxy: GeometryProxy) -> Bool {
@@ -76,11 +14,6 @@ enum DYDuoMetrics {
         }
         return false
     }
-}
-
-struct DYRailTrailingPref: PreferenceKey {
-    static var defaultValue: CGFloat { DYDuoMetrics.railDefaultTrailing }
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 // MARK: - 折痕 / 摄像头：整组小幅平移，不大挪

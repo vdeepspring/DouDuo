@@ -2,6 +2,170 @@ import XCTest
 
 /// DouDuo 核心流程：推荐流加载 → 视频在走 → 上滑切下一条 → 横滑快进 → 点作者进主页 → 能返回原生页
 final class DouDuoUITests: XCTestCase {
+    /// 只读采样手机上已安装的正式抖音 UI；默认跳过，不能用 DouDuo 页面冒充原版。
+    func testOriginalLiveReference() throws {
+        guard ProcessInfo.processInfo.environment["DOUDUO_ORIGINAL_REF"] == "1" else {
+            throw XCTSkip("仅在连接已安装正式抖音的真机时手动启用")
+        }
+        let app = XCUIApplication(bundleIdentifier: "com.ss.iphone.ugc.Aweme")
+        app.activate()
+        sleep(5)
+        guard app.state == .runningForeground else { throw XCTSkip("手机正在使用其他 App，停止采样") }
+        print("DDORIGINAL_HOME\n\(app.debugDescription)\nDDORIGINAL_END")
+        attach(app, "original-home")
+        let entry = app.descendants(matching: .any).matching(NSPredicate(format: "label == '直播'")).allElementsBoundByIndex.first { $0.isHittable }
+        if let entry {
+            entry.tap()
+            sleep(6)
+            guard app.state == .runningForeground else { throw XCTSkip("原版已不在前台，停止采样") }
+            print("DDORIGINAL_LIVE\n\(app.debugDescription)\nDDORIGINAL_END")
+            attach(app, "original-live")
+        }
+        let roomEntry = app.buttons.matching(NSPredicate(format: "label CONTAINS '点击进入直播间'")).firstMatch
+        if roomEntry.waitForExistence(timeout: 8), roomEntry.isHittable {
+            roomEntry.tap()
+            sleep(6)
+            guard app.state == .runningForeground else { throw XCTSkip("原版已不在前台，进房采样作废") }
+            print("DDORIGINAL_ROOM\n\(app.debugDescription)\nDDORIGINAL_END")
+            attach(app, "original-room")
+        }
+    }
+
+    func testLivePagesFillViewport() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["DOUDUO_STARTLIVE"] = "1"
+        app.launch()
+        let current = app.staticTexts["live.currentID"]
+        XCTAssertTrue(current.waitForExistence(timeout: 30))
+        let loaded = expectation(for: NSPredicate(format: "label != '-'"), evaluatedWith: current)
+        XCTAssertEqual(XCTWaiter().wait(for: [loaded], timeout: 40), .completed)
+        for index in 0..<2 {
+            let id = current.label
+            let page = app.otherElements["live.page.\(id)"]
+            XCTAssertTrue(page.waitForExistence(timeout: 5))
+            let window = app.windows.firstMatch.frame
+            XCTAssertEqual(page.frame.height, window.height, accuracy: 1, "直播页必须覆盖实际视口，不能少掉底部安全区")
+            XCTAssertEqual(page.frame.maxY, window.maxY, accuracy: 1, "静止时页底必须与窗口底边重合")
+            attach(app, "live-page-fill-\(index)")
+            if index == 0 {
+                app.swipeUp(velocity: .slow)
+                let changed = expectation(for: NSPredicate(format: "label != %@", id), evaluatedWith: current)
+                XCTAssertEqual(XCTWaiter().wait(for: [changed], timeout: 10), .completed)
+                sleep(1)
+            }
+        }
+    }
+
+    func testNativeLiveRoomFlow() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["DOUDUO_STARTLIVE"] = "1"
+        app.launch()
+        let categories = app.buttons["live.categories"]
+        XCTAssertTrue(categories.waitForExistence(timeout: 15), "分类应收成一个按钮")
+        XCTAssertFalse(app.buttons["英雄联盟"].exists, "分类不能常驻")
+        categories.tap()
+        XCTAssertTrue(app.buttons["英雄联盟"].waitForExistence(timeout: 5))
+        attach(app, "live-category-picker")
+        app.buttons["live.categories.close"].tap()
+        let enter = app.buttons.matching(identifier: "live.room.enter").firstMatch
+        XCTAssertTrue(enter.waitForExistence(timeout: 30))
+        XCTAssertTrue(enter.isHittable)
+        let id = app.staticTexts["live.currentID"].label
+        enter.tap()
+        XCTAssertTrue(app.buttons["live.room.close"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.textFields["live.chat.input"].exists)
+        XCTAssertFalse(app.buttons["live.categories"].exists, "进房后不显示首页分类按钮")
+        XCTAssertFalse(app.buttons["douyin.web.close"].exists, "进房不能打开网页版播放器")
+        attach(app, "native-live-room")
+        app.buttons["live.room.more"].tap()
+        app.buttons["清屏"].tap()
+        XCTAssertTrue(app.buttons["live.room.restore"].waitForExistence(timeout: 5))
+        app.buttons["live.room.restore"].tap()
+        app.buttons["live.room.close"].tap()
+        XCTAssertTrue(categories.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["live.currentID"].label, id, "退房应回到同一个直播预览")
+        attach(app, "live-preview-return")
+        app.swipeUp(velocity: .slow)
+        let current = app.staticTexts["live.currentID"]
+        let changed = expectation(for: NSPredicate(format: "label != %@", id), evaluatedWith: current)
+        XCTAssertEqual(XCTWaiter().wait(for: [changed], timeout: 10), .completed, "上滑应换到相邻房间")
+        let nextID = current.label
+        sleep(3)
+        XCTAssertEqual(current.label, nextID, "停止滑动后不应因布局回写继续乱跳")
+    }
+
+    /// 真机/模拟器均可跑；计时以 App 的 DDLIVE_READY 日志为准，截图另证是否实际出画。
+    func testNativeLivePerformance() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["DOUDUO_STARTLIVE"] = "1"
+        app.launchEnvironment["DOUDUO_LIVEPROBE"] = "1"
+        app.launch()
+        let current = app.staticTexts["live.currentID"]
+        let status = app.staticTexts["live.status"]
+        XCTAssertTrue(current.waitForExistence(timeout: 30))
+        for index in 0..<3 {
+            let ready = expectation(for: NSPredicate(format: "label == '1'"), evaluatedWith: status)
+            XCTAssertEqual(XCTWaiter().wait(for: [ready], timeout: 45), .completed, "当前房间没有视频输出")
+            guard app.state == .runningForeground else { throw XCTSkip("用户切走了 App，本次截图作废") }
+            let id = current.label
+            attach(app, "device-live-frame-\(index)")
+            let progress = app.staticTexts["live.time"].label
+            print("DDDEVICE_SAMPLE index=\(index) id=\(id) progress=\(progress)")
+            if index < 2 {
+                let changed = expectation(for: NSPredicate(format: "label != %@", id), evaluatedWith: current)
+                XCTAssertEqual(XCTWaiter().wait(for: [changed], timeout: 30), .completed, "探针没有切到下一间")
+            }
+        }
+    }
+
+    func testConditionalTitleExpansion() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["DOUDUO_TITLETEST"] = "1"
+        app.launch()
+        let short = app.otherElements["title.short"]
+        let long = app.otherElements["title.long"]
+        XCTAssertTrue(short.waitForExistence(timeout: 10))
+        XCTAssertFalse(short.buttons["douyin.description.toggle"].exists, "短标题不应出现展开按钮")
+        let toggle = long.buttons["douyin.description.toggle"]
+        XCTAssertTrue(toggle.exists, "长标题被截断时应有展开按钮")
+        XCTAssertEqual(toggle.label, "展开")
+        let collapsedHeight = long.frame.height
+        toggle.tap()
+        XCTAssertEqual(toggle.label, "收起")
+        sleep(1)
+        XCTAssertGreaterThan(long.frame.height, collapsedHeight, "展开后应显示完整标题而不只是切换按钮文字")
+        attach(app, "expanded-title")
+        toggle.tap()
+        XCTAssertEqual(toggle.label, "展开")
+        sleep(1)
+        attach(app, "conditional-title")
+    }
+
+    func testCompactLayoutAndAuthorEntry() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let current = app.staticTexts["douyin.currentID"]
+        XCTAssertTrue(current.waitForExistence(timeout: 30))
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation(for: NSPredicate(format: "label != '-'"), evaluatedWith: current)], timeout: 60), .completed)
+        sleep(3)
+        XCTAssertFalse(app.buttons.matching(identifier: "douyin.follow").allElementsBoundByIndex.contains { $0.isHittable })
+        let desc = app.staticTexts.matching(identifier: "douyin.description").allElementsBoundByIndex.first { $0.isHittable }
+        XCTAssertNotNil(desc)
+        if let desc { XCTAssertLessThan(desc.frame.height, 40, "标题默认应只有一行") }
+        let toggle = app.buttons.matching(identifier: "douyin.description.toggle").allElementsBoundByIndex.first { $0.isHittable }
+        XCTAssertNotNil(toggle)
+        toggle?.tap()
+        XCTAssertTrue(app.buttons["收起"].exists)
+        app.buttons["收起"].tap()
+        attach(app, "compact-single-line")
+        let author = app.buttons.matching(identifier: "douyin.author").allElementsBoundByIndex.first { $0.isHittable }
+        XCTAssertNotNil(author)
+        author?.tap()
+        XCTAssertTrue(app.buttons["douyin.author.follow"].waitForExistence(timeout: 15))
+        attach(app, "author-follow-retained")
+        app.buttons["douyin.author.back"].tap()
+    }
+
     func testCoreFlow() throws {
         let app = XCUIApplication()
         app.launch()

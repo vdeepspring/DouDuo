@@ -268,12 +268,29 @@ private struct DouyinWebContainer: UIViewRepresentable {
         cfg.websiteDataStore = .default()            // 登录态持久化
         cfg.allowsInlineMediaPlayback = true
         cfg.mediaTypesRequiringUserActionForPlayback = []
+        // 网页全屏按钮走网页自己的全屏（同电脑版），不弹系统播放器；系统播放器退出后网页还以为在全屏，再点就没反应
+        cfg.preferences.isElementFullscreenEnabled = true
         cfg.allowsPictureInPictureMediaPlayback = true
         cfg.defaultWebpagePreferences.preferredContentMode = .mobile   // 电脑版靠 UA；.desktop 会锁死 viewport 缩放
         cfg.userContentController.addUserScript(
             WKUserScript(source: DouyinWeb.bootstrapJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         cfg.userContentController.addUserScript(
             WKUserScript(source: DouyinWeb.bootstrapJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        // 电脑版直播间的播放器要 MediaSource，iPhone 的 WebView 只有 ManagedMediaSource（iOS 17.1+），
+        // 没有它就一直「直播加载中」。这里把它补成 MediaSource；ManagedMediaSource 要求关掉隔空播放才能挂到 <video> 上
+        cfg.userContentController.addUserScript(WKUserScript(source: """
+        (() => {
+          if (window.MediaSource || !window.ManagedMediaSource) return;
+          window.MediaSource = window.ManagedMediaSource;
+          window.SourceBuffer = window.SourceBuffer || window.ManagedSourceBuffer;
+          const d = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+          if (d && d.set) Object.defineProperty(HTMLMediaElement.prototype, 'src', { configurable: true, get: d.get,
+            set(v) { try { this.disableRemotePlayback = true } catch (e) {} d.set.call(this, v) } });
+          const so = HTMLMediaElement.prototype.hasOwnProperty('srcObject') && Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+          if (so && so.set) Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', { configurable: true, get: so.get,
+            set(v) { try { this.disableRemotePlayback = true } catch (e) {} so.set.call(this, v) } });
+        })();
+        """, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let wv = DouyinFitWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = DouyinWeb.userAgent
         wv.navigationDelegate = model

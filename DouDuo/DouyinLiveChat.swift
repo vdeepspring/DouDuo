@@ -159,8 +159,9 @@ final class DYLiveChatBox: ObservableObject {
 /// 订阅聊天消息的那一小块：新消息只重算这里
 struct DYLiveChatLiveOverlay: View {
     @ObservedObject var chat: DYLiveChat
+    var bottomPadding: CGFloat = 6
     var body: some View {
-        if !chat.messages.isEmpty { DYLiveChatOverlay(messages: chat.messages).padding(.bottom, 6) }
+        if !chat.messages.isEmpty { DYLiveChatOverlay(messages: chat.messages).padding(.bottom, bottomPadding) }
     }
 }
 

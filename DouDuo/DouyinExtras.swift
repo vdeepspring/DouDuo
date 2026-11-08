@@ -776,6 +776,7 @@ struct DYListTarget: Identifiable {
 struct DYSearchScreen: View {
     let bridge: DouyinBridge
     let onAuthor: (DYAweme) -> Void
+    var initialQuery: String = ""
     @Environment(\.dismiss) private var dismiss
     @State private var kw = ""
     @State private var sugs: [DYSug] = []
@@ -856,7 +857,9 @@ struct DYSearchScreen: View {
         .background(Color.black.ignoresSafeArea())
         .task { if hot.isEmpty { hot = await bridge.hotSearch() } }
         .onAppear {
-            focused = true
+            if !initialQuery.isEmpty {
+                if lastRun.isEmpty { run(initialQuery) }
+            } else { focused = true }
             #if DEBUG
             if let w = ProcessInfo.processInfo.environment["DOUDUO_SEARCHKW"] { run(w) }
             else if ProcessInfo.processInfo.environment["DOUDUO_SEARCHCAT"] == "1" { run("猫") }
@@ -1307,6 +1310,11 @@ struct DYFollowFeed: View {
     let onAuthor: (DYAweme) -> Void
     let onLogin: () -> Void
     let onToast: (String) -> Void
+    var onLive: (DYLiveRoom) -> Void = { _ in }
+    @Environment(\.horizontalSizeClass) private var hSize
+    @Environment(\.appTheme) private var theme
+    @Environment(\.colorScheme) private var scheme
+    @State private var liveNow: [DYLiveRoom] = []
     @StateObject private var model: DYPagedModelHolder = DYPagedModelHolder()
     @State private var currentID: String?
     @State private var preloader = DYPreloader()
@@ -1359,6 +1367,9 @@ struct DYFollowFeed: View {
                 .ignoresSafeArea()
             }
         }
+        .overlay(alignment: .top) {
+            if !liveNow.isEmpty { liveRow.padding(.top, (hSize == .regular ? 20 : 80) + 52) }
+        }
         .sheet(isPresented: $showComments) {
             if let cur = m.items.first(where: { $0.id == currentID }) {
                 DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
@@ -1366,6 +1377,7 @@ struct DYFollowFeed: View {
             }
         }
         .task {
+            Task { await loadLiveNow() }
             if m.items.isEmpty { await m.loadMore() }
             if currentID == nil { currentID = m.items.first?.id }
         }
@@ -1375,8 +1387,44 @@ struct DYFollowFeed: View {
             preloader.update(m.items, current: i)
             if i >= m.items.count - 4 { Task { await m.loadMore() } }
         }
-        .onChange(of: active) { _, a in if !a { preloader.clear() } }
+        .onChange(of: active) { _, a in if !a { preloader.clear() } else { Task { await loadLiveNow() } } }
         .onDisappear { preloader.clear() }
+    }
+
+    private func loadLiveNow() async {
+        if let r = try? await bridge.fetchFollowLive() { liveNow = r }
+    }
+
+    /// 顶部「直播中」头像：跟抖音关注页一样，点了直接进这个主播的直播间
+    private var liveRow: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 14) {
+                ForEach(liveNow) { r in
+                    Button { onLive(r) } label: {
+                        VStack(spacing: 4) {
+                            CachedAsyncImage(url: r.avatar.flatMap(URL.init(string:))) { img in img.resizable().scaledToFill() }
+                                placeholder: { theme.media.chromeFill.color(for: scheme) }
+                                .frame(width: 58, height: 58).clipShape(Circle())
+                                .padding(3)
+                                .overlay(Circle().stroke(theme.status.danger.color(for: scheme), lineWidth: 2.5))
+                                .overlay(alignment: .bottom) {
+                                    Text("直播中").font(.caption2.weight(.bold)).foregroundStyle(theme.media.onMedia.color(for: scheme))
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(Capsule().fill(theme.status.danger.color(for: scheme)))
+                                        .offset(y: 6)
+                                }
+                            Text(r.owner).font(.caption2).foregroundStyle(theme.media.onMedia.color(for: scheme)).lineLimit(1).frame(width: 70)
+                                .padding(.top, 4)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14)
+        }
+        .scrollIndicators(.hidden)
+        .padding(.trailing, insets.trailing)
+        .themeShadow(.mediaLabel)
     }
 
     private func like(_ id: String, force: Bool?) {

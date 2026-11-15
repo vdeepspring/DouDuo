@@ -1,0 +1,87 @@
+# 云端编译未签名 IPA（不需要自己的 Mac 开机）
+# 触发：推送到 main / claude/** 分支，或在 Actions 页面手动点 Run workflow
+# 产物：Actions 运行页底部的 Artifacts → DouDuo-unsigned-ipa（下载后用爱思助手等自签安装）
+name: Build IPA
+
+on:
+  push:
+    branches: [main, "claude/**", "ci/**"]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Release（正式）或 Debug（带 ddlog 诊断日志）"
+        default: Release
+
+env:
+  # 分支名带 debug（如 ci/debug-xxx）就编 Debug
+  CONFIG: ${{ inputs.configuration || (contains(github.ref_name, 'debug') && 'Debug') || 'Release' }}
+
+jobs:
+  build:
+    # 源码用了 iOS 27.1 API，必须 Xcode 27（iOS 27.1+ SDK）；GitHub 的 Xcode 27 预览镜像标签是 xcode-27
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选用最新 Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          # 按 Xcode 自身版本号挑最新的（含 beta）
+          XC=$(for x in /Applications/Xcode*.app; do
+                 v=$(defaults read "$x/Contents/version.plist" CFBundleShortVersionString 2>/dev/null) && echo "$v $x"
+               done | sort -V | tail -1 | cut -d' ' -f2-)
+          echo "使用 $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          # 源码里有 iOS 27.1 专属 API：SDK 低于 27.1 直接失败，不出降级包
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK $SDK"
+          if [ "$(printf '%s\n27.1\n' "$SDK" | sort -V | head -1)" != "27.1" ]; then
+            echo "❌ iOS SDK $SDK < 27.1"; exit 1
+          fi
+
+      - name: 缓存 VLCKit（约 1GB）
+        uses: actions/cache@v4
+        with:
+          path: Vendor/VLCKit/VLCKit-all.xcframework
+          key: vlckit-3.6.0
+
+      - name: 下载 VLCKit
+        run: ./scripts/fetch-vlckit.sh
+
+      - name: 生成工程
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          mkdir -p build
+          STATUS=0
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration "$CONFIG" -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build/dd build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO > build/xcodebuild.log 2>&1 || STATUS=$?
+          grep -E "error:|\*\* BUILD" build/xcodebuild.log | sort -u | head -80 || true
+          [ "$STATUS" -eq 0 ] || { echo "❌ xcodebuild 失败 ($STATUS)"; tail -40 build/xcodebuild.log; exit 1; }
+          # 主程序必须存在且是 arm64 可执行文件，否则不出包（之前就是编译失败还打了个空壳包）
+          APP=build/dd/Build/Products/$CONFIG-iphoneos/DouDuo.app
+          test -f "$APP/DouDuo"
+          file "$APP/DouDuo"
+          ls "$APP/Frameworks"
+
+      - name: 打包 IPA
+        run: |
+          VER=$(grep -E '^ +MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}')
+          BUILD=$(grep -E '^ +CURRENT_PROJECT_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
+          mkdir -p build/ipa/Payload
+          cp -R "build/dd/Build/Products/$CONFIG-iphoneos/DouDuo.app" build/ipa/Payload/
+          SUFFIX=""; [ "$CONFIG" = "Release" ] || SUFFIX="-$CONFIG"
+          (cd build/ipa && zip -qry "../DouDuo-$VER-$BUILD$SUFFIX-unsigned.ipa" Payload)
+          ls -lh build/*.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DouDuo-unsigned-ipa
+          path: build/*.ipa
+          retention-days: 14

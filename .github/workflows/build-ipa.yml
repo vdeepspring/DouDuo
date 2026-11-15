@@ -7,6 +7,14 @@ on:
   push:
     branches: [main, "claude/**", "ci/**"]
   workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Release（正式）或 Debug（带 ddlog 诊断日志）"
+        default: Release
+
+env:
+  # 分支名带 debug（如 ci/debug-xxx）就编 Debug
+  CONFIG: ${{ inputs.configuration || (contains(github.ref_name, 'debug') && 'Debug') || 'Release' }}
 
 jobs:
   build:
@@ -51,13 +59,13 @@ jobs:
         run: |
           mkdir -p build
           STATUS=0
-          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release -sdk iphoneos \
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration "$CONFIG" -sdk iphoneos \
             -destination 'generic/platform=iOS' -derivedDataPath build/dd build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO > build/xcodebuild.log 2>&1 || STATUS=$?
           grep -E "error:|\*\* BUILD" build/xcodebuild.log | sort -u | head -80 || true
           [ "$STATUS" -eq 0 ] || { echo "❌ xcodebuild 失败 ($STATUS)"; tail -40 build/xcodebuild.log; exit 1; }
           # 主程序必须存在且是 arm64 可执行文件，否则不出包（之前就是编译失败还打了个空壳包）
-          APP=build/dd/Build/Products/Release-iphoneos/DouDuo.app
+          APP=build/dd/Build/Products/$CONFIG-iphoneos/DouDuo.app
           test -f "$APP/DouDuo"
           file "$APP/DouDuo"
           ls "$APP/Frameworks"
@@ -67,8 +75,9 @@ jobs:
           VER=$(grep -E '^ +MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}')
           BUILD=$(grep -E '^ +CURRENT_PROJECT_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
           mkdir -p build/ipa/Payload
-          cp -R build/dd/Build/Products/Release-iphoneos/DouDuo.app build/ipa/Payload/
-          (cd build/ipa && zip -qry "../DouDuo-$VER-$BUILD-unsigned.ipa" Payload)
+          cp -R "build/dd/Build/Products/$CONFIG-iphoneos/DouDuo.app" build/ipa/Payload/
+          SUFFIX=""; [ "$CONFIG" = "Release" ] || SUFFIX="-$CONFIG"
+          (cd build/ipa && zip -qry "../DouDuo-$VER-$BUILD$SUFFIX-unsigned.ipa" Payload)
           ls -lh build/*.ipa
 
       - uses: actions/upload-artifact@v4

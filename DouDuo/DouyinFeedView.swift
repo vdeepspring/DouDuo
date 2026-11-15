@@ -3771,6 +3771,13 @@ struct DYUpstreamVideoPage: View {
             .first(where: \.isKeyWindow)?.safeAreaInsets.right ?? 0
         return max(insets.trailing, windowInset)
     }
+    /// 外屏右侧的互动栏叠在视频页上方，播放器本身不会自动知道这块占位。
+    /// 传给 PlayerPage 后，底部进度条会和视频可用宽度保持一致，不再伸进互动栏。
+    private var videoChromeInsets: EdgeInsets {
+        guard DYDuoMetrics.isDuoHardware, hSize == .compact else { return EdgeInsets() }
+        let railReserve = max(systemColumnInset, railWidth + chromeSidePadding)
+        return EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: railReserve + chromeSidePadding)
+    }
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     let item: DYAweme
@@ -3864,6 +3871,7 @@ struct DYUpstreamVideoPage: View {
                                     headEndSeconds: nil,
                                     continuationURL: nil,
                                     boost: boost)
+                    .environment(\.duoContentInsets, videoChromeInsets)
             } else {
                 // 图集也要有背景音乐（原来只翻图、没声音）
                 DYImageGallery(images: item.images,

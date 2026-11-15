@@ -1328,6 +1328,7 @@ struct DYUpstreamFeedScreen: View {
     @State private var scrollID: String?
     @State private var userScrolling = false
     @State private var scrollEndTask: Task<Void, Never>?
+    @State private var focusTask: Task<Void, Never>?
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
@@ -1573,7 +1574,17 @@ struct DYUpstreamFeedScreen: View {
             // 列表非空时把 nil 顶回上一个；刷新 / 重载会先清空列表再置 nil，不受影响。
             if new == nil, let old, feed.items.contains(where: { $0.id == old }) { currentID = old; return }
             scrollID = new
-            focusCurrent()
+            // 手滑换条发生在滑动途中：预加载器要销毁 / 新建播放器，是主线程同步的重活，砸在滑动帧上会顿一下。
+            // 起播不依赖它，所以等手停下来（0.3s 没再换条）再做；点按钮 / 自动连播等非手滑的换条照旧立刻做。
+            focusTask?.cancel()
+            if userScrolling {
+                focusTask = Task {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    if !Task.isCancelled { focusCurrent() }
+                }
+            } else {
+                focusCurrent()
+            }
             saveSession()
             reportWatch(old: old, new: new)
         }
@@ -2712,6 +2723,7 @@ struct DYClassicFeedScreen: View {
     @State private var scrollID: String?
     @State private var userScrolling = false
     @State private var scrollEndTask: Task<Void, Never>?
+    @State private var focusTask: Task<Void, Never>?
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
@@ -2888,7 +2900,17 @@ struct DYClassicFeedScreen: View {
             // 列表非空时把 nil 顶回上一个；刷新 / 重载会先清空列表再置 nil，不受影响。
             if new == nil, let old, feed.items.contains(where: { $0.id == old }) { currentID = old; return }
             scrollID = new
-            focusCurrent()
+            // 手滑换条发生在滑动途中：预加载器要销毁 / 新建播放器，是主线程同步的重活，砸在滑动帧上会顿一下。
+            // 起播不依赖它，所以等手停下来（0.3s 没再换条）再做；点按钮 / 自动连播等非手滑的换条照旧立刻做。
+            focusTask?.cancel()
+            if userScrolling {
+                focusTask = Task {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    if !Task.isCancelled { focusCurrent() }
+                }
+            } else {
+                focusCurrent()
+            }
             saveSession()
             reportWatch(old: old, new: new)
         }

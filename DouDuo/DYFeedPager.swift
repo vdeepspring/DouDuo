@@ -12,8 +12,6 @@ struct DYFeedPager<Page: View>: View {
     /// 默认界面打开左右分栏搜索时要跟随窗格宽度，只锁高度；经典布局整页铺满。
     var pageAxes: Axis.Set = .vertical
     @ViewBuilder let page: (DYAweme) -> Page
-    /// 滑过半屏但还没停稳的那一条，等停稳再提交成 currentID。
-    @State private var commitTask: Task<Void, Never>?
 
     var body: some View {
         ScrollView(.vertical) {
@@ -47,24 +45,9 @@ struct DYFeedPager<Page: View>: View {
             })
         .onChange(of: scrollID) { _, id in
             guard let id, items.contains(where: { $0.id == id }) else { return }
-            guard userScrolling else {
-                if id != currentID { scrollID = currentID }
-                return
-            }
-            // ⚠️ 不要在这里直接写 currentID：scrollPosition 在新页过半屏那一帧就回写，那时手指还在拖 /
-            // 收尾动画还在跑。换条要存会话、建和销毁播放器、切音频、整屏重算，全是主线程同步活，
-            // 砸在动画帧上就是「上滑卡一下」。正常由 DYPagingSpeedBridge 停稳时（didSettle）提交；
-            // 这里只留兜底：没挂上桥接（减少动态效果）或收尾被打断时，停在这一页 0.3s 后提交。
-            commitTask?.cancel()
-            guard id != currentID else { return }
-            commitTask = Task {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                guard !Task.isCancelled, userScrolling, scrollID == id, currentID != id else { return }
-                currentID = id
-            }
+            if userScrolling { currentID = id }
+            else if id != currentID { scrollID = currentID }
         }
-        .onChange(of: currentID) { _, _ in commitTask?.cancel() }
-        .onDisappear { commitTask?.cancel() }
         .scrollIndicators(.hidden)
         .ignoresSafeArea()
     }

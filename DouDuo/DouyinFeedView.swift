@@ -3774,7 +3774,8 @@ struct DYUpstreamVideoPage: View {
     /// 外屏右侧的互动栏叠在视频页上方，播放器本身不会自动知道这块占位。
     /// 传给 PlayerPage 后，底部进度条会和视频可用宽度保持一致，不再伸进互动栏。
     private var videoChromeInsets: EdgeInsets {
-        guard DYDuoMetrics.isDuoHardware, hSize == .compact else { return EdgeInsets() }
+        // 只在「完整画面」状态给进度条让出右侧栏；铺满播放仍保持整屏进度条。
+        guard !autoFit, DYDuoMetrics.isDuoHardware, hSize == .compact else { return EdgeInsets() }
         let railReserve = max(systemColumnInset, railWidth + chromeSidePadding)
         return EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: railReserve + chromeSidePadding)
     }
@@ -3921,7 +3922,7 @@ struct DYUpstreamVideoPage: View {
                         .padding(.bottom, item.images.isEmpty ? 56 : 0)
                 }
                 .padding(.horizontal, chromeSidePadding)
-                .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 36 : 24))
+                .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 20 : 12))
                 .opacity(boost.boosting ? 0 : 1)
                 .animation(.easeOut(duration: 0.15), value: boost.boosting)
             }
@@ -4029,7 +4030,7 @@ struct DYUpstreamVideoPage: View {
         }
     }
 
-    /// 小红书式左下信息区：头像 + 昵称 + 红色「关注」胶囊，下面文案 / 音乐
+    /// 小红书式左下信息区：头像 + 昵称 + 红色「关注」胶囊，下面文案
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -4067,11 +4068,6 @@ struct DYUpstreamVideoPage: View {
                 DYExpandableTitle(text: item.desc, foreground: fg,
                                   secondary: theme.media.onMediaSecondary.color(for: scheme),
                                   hashtagNames: item.hashtagNames ?? [])
-            }
-            if !item.music.isEmpty {
-                Label(item.music, systemImage: "music.note")
-                    .font(.caption).lineLimit(1)
-                    .foregroundStyle(theme.media.onMediaSecondary.color(for: scheme))
             }
         }
         .themeShadow(.mediaLabel)
@@ -4518,7 +4514,7 @@ struct DYClassicVideoPage: View {
         }
     }
 
-    /// 作者、文案、元数据、音乐；音乐贴近进度条，作者头像归入互动栏。
+    /// 作者、文案、元数据；作者头像归入互动栏。
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Button(action: onAuthor) {
@@ -4536,12 +4532,6 @@ struct DYClassicVideoPage: View {
                     .foregroundStyle(fg.opacity(0.62))
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("douyin.video.metadata")
-            }
-            if !item.music.isEmpty {
-                Label(item.music, systemImage: "music.note")
-                    .font(.caption2).lineLimit(1)
-                    .foregroundStyle(fg.opacity(0.54))
-                    .accessibilityIdentifier("douyin.video.music")
             }
         }
         .themeShadow(.mediaLabel)

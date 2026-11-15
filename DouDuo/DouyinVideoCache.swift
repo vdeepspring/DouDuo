@@ -22,11 +22,17 @@ struct DYFeedSession: Codable {
               session.items.contains(where: { $0.id == session.currentID }) else { return nil }
         return session
     }
+    /// 串行队列：保证后写的会话不会被先写的覆盖。
+    private static let saveQueue = DispatchQueue(label: "me.rrmm.douduo.feed-session", qos: .utility)
+    /// 编码整份列表 + 原子写盘放到后台：每次换条要存两次（换条 + 上一条存进度），在主线程上做会卡滑动。
     func save() {
-        guard items.contains(where: { $0.id == currentID }),
-              let data = try? JSONEncoder().encode(self) else { return }
-        do { try data.write(to: Self.url, options: .atomic) }
-        catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
+        guard items.contains(where: { $0.id == currentID }) else { return }
+        let snapshot = self
+        Self.saveQueue.async {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            do { try data.write(to: Self.url, options: .atomic) }
+            catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
+        }
     }
 }
 

@@ -42,7 +42,7 @@ class MenuPolicyTests(unittest.TestCase):
         for token in ("douyin_portrait_ratio_v1", "douyin_portrait_only_v2",
                       "portraitRatio", "mixLabel", "竖屏占比", "douyin.mix",
                       "douyin_short_ratio_portrait_v1", "douyin_short_ratio_landscape_v1",
-                      "shortRatio", "isShort(", "wantedShort"):
+                      "shortRatio", "wantedShort"):   # isShort( 不再禁：「竖屏时只放短视频」是开关式限定，不是占比
             self.assertNotIn(token, FEED)
 
     def test_live_module_menu_actions_follow_the_selected_module(self):
@@ -277,7 +277,23 @@ remix.landscapeWhenWide = false
 remix.remix(after: 0)
 precondition(remix.items.map(\.id) == ["current", "upcoming-tall", "upcoming-wide"], "\(remix.items.map(\.id))")
 precondition(DYFeedModel.isPortrait(DYAweme(id: "gallery", images: ["fixture"])))
-print("PASS 70% portrait interleave; per-orientation order kept; relaxed fallback; landscape-only filter; toggle back; remix; gallery classification")
+// 5) 竖着看 + 只放短视频：长的留在候选池（原顺序），横过来再放；关掉开关照常放
+preferences.removePersistentDomain(forName: suiteName)
+let short = DYFeedModel()
+short.screenWide = false
+short.pool = (0..<20).map { DYAweme(id: "s\($0)", isTallFrame: true, duration: $0 % 2 == 0 ? 1500 : 40) }
+precondition(short.shortOnlyActive)
+precondition(short.fill(20, relaxed: true) == 10 && short.items.allSatisfy(DYFeedModel.isShort))
+precondition(short.fill(5, relaxed: true) == 0, "relaxed must not leak long videos while tall")
+precondition(short.pool.map(\.id) == (0..<20).filter { $0 % 2 == 0 }.map { "s\($0)" })
+short.screenWide = true
+short.landscapeWhenWide = false
+precondition(!short.shortOnlyActive && short.fill(3, relaxed: true) == 3 && short.items.suffix(3).map(\.id) == ["s0", "s2", "s4"])
+short.screenWide = false
+short.shortWhenTall = false
+precondition(!short.shortOnlyActive && short.fill(2, relaxed: true) == 2)
+precondition(DYFeedModel.isShort(DYAweme(id: "edge", duration: 180)) && !DYFeedModel.isShort(DYAweme(id: "long", duration: 181)))
+print("PASS 70% portrait interleave; per-orientation order kept; relaxed fallback; landscape-only filter; toggle back; remix; gallery classification; tall short-only gate")
 '''
         scratch = Path(tempfile.gettempdir())
         scratch.mkdir(parents=True, exist_ok=True)

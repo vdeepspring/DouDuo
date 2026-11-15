@@ -17,6 +17,7 @@ struct DYSettingsScreen: View {
     @AppStorage(DYVideoAmbient.key) private var ambientLevel = DYVideoAmbient.defaultLevel
     // 内容
     @AppStorage("douyin_wide_landscape_v1") private var landscapeOnly = true
+    @AppStorage("douyin_tall_short_v1") private var shortWhenTall = true
     @AppStorage(DYHashtagFilter.storageKey) private var blockedHashtags = ""
     // 弹幕
     @AppStorage("douyin_danmaku_v1") private var danmakuEnabled = true
@@ -75,10 +76,11 @@ struct DYSettingsScreen: View {
                     }
                     .accessibilityIdentifier("douyin.hashtags.manage")
                     Toggle("横屏时只放横屏内容", isOn: $landscapeOnly).accessibilityIdentifier("douyin.landscape.only")
+                    Toggle("竖屏时只放短视频（3 分钟内）", isOn: $shortWhenTall).accessibilityIdentifier("douyin.tall.short")
                 } header: {
                     Text("内容偏好")
                 } footer: {
-                    Text("推荐按抖音推荐顺序播放；横着看且开启「只放横屏内容」时跳过竖屏视频。标签过滤只作用于推荐页。")
+                    Text("推荐按抖音推荐顺序播放；横着看且开启「只放横屏内容」时跳过竖屏视频；竖着看且开启「只放短视频」时长视频先留着，横过来再放。标签过滤只作用于推荐页。")
                 }
 
                 Section {

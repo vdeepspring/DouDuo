@@ -1162,6 +1162,19 @@ final class DYFeedModel: ObservableObject {
     /// 「横着看 + 只放横屏内容」时只取横屏。暂时没排进去的留在候选池，保持推荐原顺序。
     /// 横着看（屏幕/播放区比高宽）时只放横屏视频
     @AppStorage("douyin_wide_landscape_v1") var landscapeWhenWide = true
+    /// 竖着看时只放短视频：网页推荐接口长视频（十几分钟到几十分钟）很多，竖着刷不合适；
+    /// 长的留在候选池，横过来再放。
+    @AppStorage("douyin_tall_short_v1") var shortWhenTall = true
+    /// 「短视频」上限（秒）。图集没有时长，算短。
+    static let shortMaxSeconds: Double = 180
+    static func isShort(_ a: DYAweme) -> Bool { a.duration <= shortMaxSeconds }
+    var shortOnlyActive: Bool { !screenWide && shortWhenTall }
+    /// 当前方向下能不能放：横屏限定只要横屏，竖着看限定只要短视频。
+    func eligible(_ a: DYAweme) -> Bool {
+        if landscapeOnlyActive { return !Self.isPortrait(a) }
+        if shortOnlyActive { return Self.isShort(a) }
+        return true
+    }
     /// 视频比屏幕窄（左右黑边）时自动放大铺满宽度；菜单里可关
     @AppStorage("douyin_autofit_v1") var autoFit = true
     /// 当前播放区是不是横的（宽 > 高），由页面布局同步
@@ -1192,13 +1205,11 @@ final class DYFeedModel: ObservableObject {
         var n = 0
         while n < maxN, !pool.isEmpty {
             let idx: Int?
-            if r <= 0 {
-                idx = pool.firstIndex { !Self.isPortrait($0) }
-            } else if relaxed {
-                idx = 0
+            if r <= 0 || relaxed {
+                idx = pool.firstIndex { eligible($0) }
             } else {
                 let wantPortrait = mixCredit + r >= 1 - 1e-9
-                idx = pool.firstIndex { Self.isPortrait($0) == wantPortrait }
+                idx = pool.firstIndex { eligible($0) && Self.isPortrait($0) == wantPortrait }
             }
             guard let i = idx else { break }
             let a = pool.remove(at: i)
@@ -1231,7 +1242,8 @@ final class DYFeedModel: ObservableObject {
         // 超上限：先丢当前用得少的那一类里最早的（横屏限定丢竖屏；竖着看丢横屏，接口横屏本来就多）
         while pool.count > Self.poolCap {
             let dropPortrait = landscapeOnlyActive
-            if let i = pool.firstIndex(where: { Self.isPortrait($0) == dropPortrait }) { pool.remove(at: i) }
+            if let i = pool.firstIndex(where: { !eligible($0) }) { pool.remove(at: i) }
+            else if let i = pool.firstIndex(where: { Self.isPortrait($0) == dropPortrait }) { pool.remove(at: i) }
             else { pool.removeFirst() }
         }
     }
@@ -1267,6 +1279,11 @@ final class DYFeedModel: ObservableObject {
             }
             // 竖横凑不齐（如接口连着几页没竖屏）时按原顺序补，横屏限定不放宽
             if added == 0, !landscapeOnlyActive { added += fill(want, relaxed: true) }
+            // 连拉几页一条短的都没有：按原顺序放长的，宁可刷到长视频也不要卡住没得刷
+            if added == 0, shortOnlyActive {
+                let n = min(want, pool.count)
+                items.append(contentsOf: pool.prefix(n)); pool.removeFirst(n); added += n
+            }
             trimPool()
             DYLiveModel.log("DDMIX added=\(added) pool=\(pool.count) ratio=\(String(format: "%.2f", targetRatio)) landscapeOnly=\(landscapeOnlyActive) wide=\(screenWide) recent=\(items.suffix(20).filter(Self.isPortrait).count)/\(min(20, items.count))")
             error = (items.isEmpty && added == 0) ? (DYHashtagFilter(rawValue: defaults.string(forKey: DYHashtagFilter.storageKey) ?? "").tags.isEmpty
@@ -1569,6 +1586,7 @@ struct DYUpstreamFeedScreen: View {
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .task(id: blockedHashtags) { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
+        .onChange(of: feed.shortWhenTall) { _, _ in remixUpcoming() }
         .onDisappear { live.stop(); preloader.clear() }
     }
 
@@ -2883,6 +2901,7 @@ struct DYClassicFeedScreen: View {
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .task(id: blockedHashtags) { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
+        .onChange(of: feed.shortWhenTall) { _, _ in remixUpcoming() }
         .onDisappear { live.stop(); preloader.clear() }
         .environment(\.dyOpenSettings, { showSettings = true })
         .sheet(isPresented: $showSettings) {

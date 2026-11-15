@@ -1,0 +1,58 @@
+name: Build unsigned IPA
+
+# 手动触发，或推到 ci/** 分支时编译未签名 IPA，产物在 Actions 运行页的 Artifacts 里下载。
+on:
+  workflow_dispatch:
+  push:
+    branches: ["ci/**"]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode (need iOS 27.1 SDK or later)
+        run: |
+          ls -d /Applications/Xcode*.app
+          XCODE=$(ls -d /Applications/Xcode*.app | grep -v -i beta | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK $SDK"
+          python3 - "$SDK" <<'EOF'
+          import sys
+          v = tuple(int(x) for x in sys.argv[1].split(".")[:2])
+          sys.exit(0 if v >= (27, 1) else "runner 上最新的 iOS SDK 是 %s，项目需要 27.1 以上" % sys.argv[1])
+          EOF
+
+      - name: Cache VLCKit
+        uses: actions/cache@v4
+        with:
+          path: Vendor/VLCKit/VLCKit-all.xcframework
+          key: vlckit-3.6.0
+
+      - name: Fetch VLCKit
+        run: ./scripts/fetch-vlckit.sh
+
+      - name: Generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build (Release, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/dd" build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tail -n 200
+
+      - name: Package IPA
+        run: python3 scripts/package_unsigned.py "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/DouDuo.app" out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DouDuo-unsigned-ipa
+          path: out/*
+          if-no-files-found: error

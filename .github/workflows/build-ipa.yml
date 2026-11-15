@@ -64,8 +64,8 @@ jobs:
 
       - name: 打包 IPA
         run: |
-          VER=$(grep MARKETING_VERSION project.yml | awk '{print $2}')
-          BUILD=$(grep CURRENT_PROJECT_VERSION project.yml | awk '{print $2}' | tr -d '"')
+          VER=$(grep -E '^ +MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}')
+          BUILD=$(grep -E '^ +CURRENT_PROJECT_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
           mkdir -p build/ipa/Payload
           cp -R build/dd/Build/Products/Release-iphoneos/DouDuo.app build/ipa/Payload/
           (cd build/ipa && zip -qry "../DouDuo-$VER-$BUILD-unsigned.ipa" Payload)

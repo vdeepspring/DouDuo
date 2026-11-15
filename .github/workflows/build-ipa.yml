@@ -1,58 +1,78 @@
-name: Build unsigned IPA
+# 云端编译未签名 IPA（不需要自己的 Mac 开机）
+# 触发：推送到 main / claude/** 分支，或在 Actions 页面手动点 Run workflow
+# 产物：Actions 运行页底部的 Artifacts → DouDuo-unsigned-ipa（下载后用爱思助手等自签安装）
+name: Build IPA
 
-# 手动触发，或推到 ci/** 分支时编译未签名 IPA，产物在 Actions 运行页的 Artifacts 里下载。
 on:
-  workflow_dispatch:
   push:
-    branches: ["ci/**"]
+    branches: [main, "claude/**", "ci/**"]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-27
+    # 源码用了 iOS 27.1 API，必须 Xcode 27（iOS 27.1+ SDK）；GitHub 的 Xcode 27 预览镜像标签是 xcode-27
+    runs-on: xcode-27
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select newest Xcode (need iOS 27.1 SDK or later)
+      - name: 选用最新 Xcode
         run: |
           ls -d /Applications/Xcode*.app
-          XCODE=$(ls -d /Applications/Xcode*.app | grep -v -i beta | sort -V | tail -1)
-          sudo xcode-select -s "$XCODE"
+          # 按 Xcode 自身版本号挑最新的（含 beta）
+          XC=$(for x in /Applications/Xcode*.app; do
+                 v=$(defaults read "$x/Contents/version.plist" CFBundleShortVersionString 2>/dev/null) && echo "$v $x"
+               done | sort -V | tail -1 | cut -d' ' -f2-)
+          echo "使用 $XC"
+          sudo xcode-select -s "$XC"
           xcodebuild -version
+          # 源码里有 iOS 27.1 专属 API：SDK 低于 27.1 直接失败，不出降级包
           SDK=$(xcrun --sdk iphoneos --show-sdk-version)
           echo "iOS SDK $SDK"
-          python3 - "$SDK" <<'EOF'
-          import sys
-          v = tuple(int(x) for x in sys.argv[1].split(".")[:2])
-          sys.exit(0 if v >= (27, 1) else "runner 上最新的 iOS SDK 是 %s，项目需要 27.1 以上" % sys.argv[1])
-          EOF
+          if [ "$(printf '%s\n27.1\n' "$SDK" | sort -V | head -1)" != "27.1" ]; then
+            echo "❌ iOS SDK $SDK < 27.1"; exit 1
+          fi
 
-      - name: Cache VLCKit
+      - name: 缓存 VLCKit（约 1GB）
         uses: actions/cache@v4
         with:
           path: Vendor/VLCKit/VLCKit-all.xcframework
           key: vlckit-3.6.0
 
-      - name: Fetch VLCKit
+      - name: 下载 VLCKit
         run: ./scripts/fetch-vlckit.sh
 
-      - name: Generate project
+      - name: 生成工程
         run: |
           brew install xcodegen
           xcodegen generate
 
-      - name: Build (Release, unsigned)
+      - name: 编译（不签名）
         run: |
-          set -o pipefail
+          mkdir -p build
+          STATUS=0
           xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release -sdk iphoneos \
-            -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/dd" build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tail -n 200
+            -destination 'generic/platform=iOS' -derivedDataPath build/dd build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO > build/xcodebuild.log 2>&1 || STATUS=$?
+          grep -E "error:|\*\* BUILD" build/xcodebuild.log | sort -u | head -80 || true
+          [ "$STATUS" -eq 0 ] || { echo "❌ xcodebuild 失败 ($STATUS)"; tail -40 build/xcodebuild.log; exit 1; }
+          # 主程序必须存在且是 arm64 可执行文件，否则不出包（之前就是编译失败还打了个空壳包）
+          APP=build/dd/Build/Products/Release-iphoneos/DouDuo.app
+          test -f "$APP/DouDuo"
+          file "$APP/DouDuo"
+          ls "$APP/Frameworks"
 
-      - name: Package IPA
-        run: python3 scripts/package_unsigned.py "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/DouDuo.app" out
+      - name: 打包 IPA
+        run: |
+          VER=$(grep MARKETING_VERSION project.yml | awk '{print $2}')
+          BUILD=$(grep CURRENT_PROJECT_VERSION project.yml | awk '{print $2}' | tr -d '"')
+          mkdir -p build/ipa/Payload
+          cp -R build/dd/Build/Products/Release-iphoneos/DouDuo.app build/ipa/Payload/
+          (cd build/ipa && zip -qry "../DouDuo-$VER-$BUILD-unsigned.ipa" Payload)
+          ls -lh build/*.ipa
 
       - uses: actions/upload-artifact@v4
         with:
           name: DouDuo-unsigned-ipa
-          path: out/*
-          if-no-files-found: error
+          path: build/*.ipa
+          retention-days: 14

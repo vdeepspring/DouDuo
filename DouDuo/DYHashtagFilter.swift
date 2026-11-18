@@ -43,3 +43,16 @@ struct DYHashtagFilter {
 extension DYAweme {
     var hashtags: [String] { DYHashtag.names(in: desc, knownNames: hashtagNames ?? []) }
 }
+
+/// 推荐内容偏好：只放竖屏内容 / 只看短视频（设置 → 内容偏好）
+enum DYContentPrefs {
+    static let portraitOnlyKey = "douyin_portrait_only_v3"
+    /// 只看短视频的时长上限（秒），0 = 不限
+    static let shortMaxKey = "douyin_short_max_v1"
+    static let shortChoices: [(Int, String)] = [(0, "不限"), (60, "1 分钟内"), (180, "3 分钟内"), (300, "5 分钟内")]
+
+    /// 图集不算时长，一律放行；拿不到时长（0）的视频在限定时不放，免得混进长视频
+    static func passesShort(_ a: DYAweme, max: Int) -> Bool {
+        max <= 0 || !a.images.isEmpty || (a.duration > 0 && a.duration <= Double(max))
+    }
+}

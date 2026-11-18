@@ -277,7 +277,24 @@ remix.landscapeWhenWide = false
 remix.remix(after: 0)
 precondition(remix.items.map(\.id) == ["current", "upcoming-tall", "upcoming-wide"], "\(remix.items.map(\.id))")
 precondition(DYFeedModel.isPortrait(DYAweme(id: "gallery", images: ["fixture"])))
-print("PASS 70% portrait interleave; per-orientation order kept; relaxed fallback; landscape-only filter; toggle back; remix; gallery classification")
+// 5) 竖着看 + 只放竖屏：只取竖屏（relaxed 也不放横屏），横屏留在候选池；横着看时横屏限定优先
+preferences.removePersistentDomain(forName: suiteName)
+let tallOnly = DYFeedModel()
+tallOnly.portraitOnly = true
+tallOnly.pool = (0..<10).map { DYAweme(id: "p\($0)", isTallFrame: $0 % 2 == 0) }
+precondition(tallOnly.portraitOnlyActive && tallOnly.targetRatio == 1)
+precondition(tallOnly.fill(10) == 5 && tallOnly.items.allSatisfy(DYFeedModel.isPortrait))
+precondition(tallOnly.fill(5, relaxed: true) == 0 && tallOnly.pool.count == 5)
+tallOnly.screenWide = true
+precondition(!tallOnly.portraitOnlyActive && tallOnly.landscapeOnlyActive && tallOnly.targetRatio == 0)
+// 6) 只看短视频：超过上限或拿不到时长的视频过滤掉，图集放行
+preferences.removePersistentDomain(forName: suiteName)
+let short = DYFeedModel(defaults: preferences)
+let clips = [DYAweme(id: "s30", duration: 30), DYAweme(id: "s61", duration: 61), DYAweme(id: "s0", duration: 0), DYAweme(id: "g", images: ["x"], duration: 0)]
+precondition(short.allowedRecommendations(clips).count == 4)
+preferences.set(60, forKey: DYContentPrefs.shortMaxKey)
+precondition(short.allowedRecommendations(clips).map(\.id) == ["s30", "g"])
+print("PASS 70% portrait interleave; per-orientation order kept; relaxed fallback; landscape-only filter; toggle back; remix; gallery classification; portrait-only; short-only")
 '''
         scratch = Path(tempfile.gettempdir())
         scratch.mkdir(parents=True, exist_ok=True)

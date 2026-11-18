@@ -1275,7 +1275,11 @@ final class DYFeedModel: ObservableObject {
 
     func allowedRecommendations(_ candidates: [DYAweme]) -> [DYAweme] {
         let filter = DYHashtagFilter(rawValue: defaults.string(forKey: DYHashtagFilter.storageKey) ?? "")
-        return candidates.filter { !filter.blocks(description: $0.desc, knownNames: $0.hashtagNames ?? []) }
+        let shortMax = defaults.integer(forKey: DYContentPrefs.shortMaxKey)
+        return candidates.filter {
+            !filter.blocks(description: $0.desc, knownNames: $0.hashtagNames ?? [])
+                && DYContentPrefs.passesShort($0, max: shortMax)
+        }
     }
 
     /// Keep the active video when possible; otherwise prefer the next surviving recommendation.
@@ -1296,6 +1300,8 @@ final class DYFeedModel: ObservableObject {
     /// 「横着看 + 只放横屏内容」时只取横屏。暂时没排进去的留在候选池，保持推荐原顺序。
     /// 横着看（屏幕/播放区比高宽）时只放横屏视频
     @AppStorage("douyin_wide_landscape_v1") var landscapeWhenWide = true
+    /// 竖着看时只放竖屏内容（图集算竖屏）；横着看仍按「横屏时只放横屏内容」
+    @AppStorage(DYContentPrefs.portraitOnlyKey) var portraitOnly = false
     /// 视频比屏幕窄（左右黑边）时自动放大铺满宽度；菜单里可关
     @AppStorage(DYVideoFit.preferenceKey) var autoFit = true
     /// 当前播放区是不是横的（宽 > 高），由页面布局同步
@@ -1313,8 +1319,10 @@ final class DYFeedModel: ObservableObject {
 
     /// 横屏限定时只要横屏。
     var landscapeOnlyActive: Bool { screenWide && landscapeWhenWide }
-    /// 当前竖屏目标：横屏限定 0，其余 70%。
-    var targetRatio: Double { landscapeOnlyActive ? 0 : Self.portraitTarget }
+    /// 竖屏限定：竖着看且开了「只放竖屏内容」时只要竖屏。
+    var portraitOnlyActive: Bool { !landscapeOnlyActive && portraitOnly }
+    /// 当前竖屏目标：横屏限定 0，竖屏限定 100%，其余 70%。
+    var targetRatio: Double { landscapeOnlyActive ? 0 : (portraitOnly ? 1 : Self.portraitTarget) }
 
     /// 从候选池往列表里排最多 maxN 条：竖横按目标比例均匀穿插（70% → 竖横竖竖横竖竖…），
     /// 同方向内保持推荐原顺序；横屏限定时只取横屏。
@@ -1328,6 +1336,8 @@ final class DYFeedModel: ObservableObject {
             let idx: Int?
             if r <= 0 {
                 idx = pool.firstIndex { !Self.isPortrait($0) }
+            } else if r >= 1 {
+                idx = pool.firstIndex { Self.isPortrait($0) }
             } else if relaxed {
                 idx = 0
             } else {
@@ -1341,6 +1351,16 @@ final class DYFeedModel: ObservableObject {
             n += 1
         }
         return n
+    }
+
+    /// 一条都没刷到时的提示：开着哪些过滤就点名哪些，方便用户知道去关哪个
+    private var emptyMessage: String {
+        var on: [String] = []
+        if !DYHashtagFilter(rawValue: defaults.string(forKey: DYHashtagFilter.storageKey) ?? "").tags.isEmpty { on.append("标签过滤") }
+        if portraitOnlyActive { on.append("只放竖屏内容") }
+        if defaults.integer(forKey: DYContentPrefs.shortMaxKey) > 0 { on.append("只看短视频") }
+        return on.isEmpty ? "暂时没刷到推荐，登录后或稍后再试"
+            : "暂时没有符合「\(on.joined(separator: "」「"))」的推荐，可在设置里放宽或稍后重试"
     }
 
     /// 横屏限定开关 / 方向变了：当前条之后的重新排（当前这条不动，不打断播放）
@@ -1408,12 +1428,11 @@ final class DYFeedModel: ObservableObject {
                 hasMore = r.hasMore || !r.items.isEmpty
                 added += fill(want - added)
             }
-            // 竖横凑不齐（如接口连着几页没竖屏）时按原顺序补，横屏限定不放宽
+            // 竖横凑不齐（如接口连着几页没竖屏）时按原顺序补，横屏限定不放宽（竖屏限定由 fill 自己只取竖屏）
             if added == 0, !landscapeOnlyActive { added += fill(want, relaxed: true) }
             trimPool()
-            DYLiveModel.log("DDMIX added=\(added) pool=\(pool.count) ratio=\(String(format: "%.2f", targetRatio)) landscapeOnly=\(landscapeOnlyActive) wide=\(screenWide) recent=\(items.suffix(20).filter(Self.isPortrait).count)/\(min(20, items.count))")
-            error = (items.isEmpty && added == 0) ? (DYHashtagFilter(rawValue: defaults.string(forKey: DYHashtagFilter.storageKey) ?? "").tags.isEmpty
-                ? "暂时没刷到推荐，登录后或稍后再试" : "暂时没有符合标签过滤条件的推荐，可调整屏蔽标签或稍后重试") : nil
+            DYLiveModel.log("DDMIX added=\(added) pool=\(pool.count) ratio=\(String(format: "%.2f", targetRatio)) landscapeOnly=\(landscapeOnlyActive) portraitOnly=\(portraitOnlyActive) shortMax=\(defaults.integer(forKey: DYContentPrefs.shortMaxKey)) wide=\(screenWide) recent=\(items.suffix(20).filter(Self.isPortrait).count)/\(min(20, items.count))")
+            error = (items.isEmpty && added == 0) ? emptyMessage : nil
         } catch {
             if !offlinePlayback, epoch == offlineEpoch, items.isEmpty { self.error = error.localizedDescription }
         }
@@ -1468,6 +1487,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
     @ObservedObject var bridge: DouyinBridge
     @ObservedObject var feed: DYFeedModel
     @AppStorage(DYHashtagFilter.storageKey) private var blockedHashtags = ""
+    @AppStorage(DYContentPrefs.shortMaxKey) private var shortMax = 0
     @Environment(\.dyHashtagFilterPresented) private var hashtagFilterPresented
     @State private var insets = EdgeInsets()
     @State var preloader = DYPreloader()
@@ -1772,8 +1792,10 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             Task { await refreshOfflineQueueIfNeeded() }
         }
         .modifier(DYOfflineAutomaticDownload(ready: initialized && !feed.items.isEmpty && !feed.offlinePlayback) { try await offlineCandidates($0) })
-        .task(id: blockedHashtags) { await applyHashtagFilter() }
+        // 标签过滤 / 只看短视频变了：重新过滤列表与候选池（当前条不符合就跳到下一条）
+        .task(id: "\(blockedHashtags)|\(shortMax)") { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
+        .onChange(of: feed.portraitOnly) { _, _ in remixUpcoming() }
         .onDisappear { live.stop(); preloader.clear() }
     }
 
@@ -2708,6 +2730,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
     @ObservedObject var bridge: DouyinBridge
     @ObservedObject var feed: DYFeedModel
     @AppStorage(DYHashtagFilter.storageKey) private var blockedHashtags = ""
+    @AppStorage(DYContentPrefs.shortMaxKey) private var shortMax = 0
     @Environment(\.dyHashtagFilterPresented) private var hashtagFilterPresented
     @State private var insets = EdgeInsets()
     @State var preloader = DYPreloader()
@@ -2977,8 +3000,10 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             Task { await refreshOfflineQueueIfNeeded() }
         }
         .modifier(DYOfflineAutomaticDownload(ready: initialized && !feed.items.isEmpty && !feed.offlinePlayback) { try await offlineCandidates($0) })
-        .task(id: blockedHashtags) { await applyHashtagFilter() }
+        // 标签过滤 / 只看短视频变了：重新过滤列表与候选池（当前条不符合就跳到下一条）
+        .task(id: "\(blockedHashtags)|\(shortMax)") { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
+        .onChange(of: feed.portraitOnly) { _, _ in remixUpcoming() }
         .onDisappear { live.stop(); preloader.clear() }
         .environment(\.dyOpenSettings, { showSettings = true })
         .sheet(isPresented: $showSettings, onDismiss: {

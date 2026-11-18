@@ -21,6 +21,8 @@ struct DYSettingsScreen: View {
     @AppStorage(DYVideoAmbient.key) private var ambientLevel = DYVideoAmbient.defaultLevel
     // 内容
     @AppStorage("douyin_wide_landscape_v1") private var landscapeOnly = true
+    @AppStorage(DYContentPrefs.portraitOnlyKey) private var portraitOnly = false
+    @AppStorage(DYContentPrefs.shortMaxKey) private var shortMax = 0
     @AppStorage(DYHashtagFilter.storageKey) private var blockedHashtags = ""
     // 弹幕
     @AppStorage("douyin_danmaku_v1") private var danmakuEnabled = true
@@ -124,10 +126,15 @@ struct DYSettingsScreen: View {
                     }
                     .accessibilityIdentifier("douyin.hashtags.manage")
                     Toggle("横屏时只放横屏内容", isOn: $landscapeOnly).accessibilityIdentifier("douyin.landscape.only")
+                    Toggle("竖屏时只放竖屏内容", isOn: $portraitOnly).accessibilityIdentifier("douyin.portrait.only")
+                    Picker("只看短视频", selection: $shortMax) {
+                        ForEach(DYContentPrefs.shortChoices, id: \.0) { Text($0.1).tag($0.0) }
+                    }
+                    .accessibilityIdentifier("douyin.short.only")
                 } header: {
                     Text("内容偏好")
                 } footer: {
-                    Text("推荐按抖音推荐顺序播放；横着看且开启「只放横屏内容」时跳过竖屏视频。标签过滤只作用于推荐页。")
+                    Text("推荐按抖音推荐顺序播放；横着看且开启「只放横屏内容」时跳过竖屏视频，竖着看且开启「只放竖屏内容」时跳过横屏视频（默认约七成竖屏穿插）。「只看短视频」按时长过滤，图集不受影响。标签过滤与这些开关只作用于推荐页。")
                 }
 
                 Section {

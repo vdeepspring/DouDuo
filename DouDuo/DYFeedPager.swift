@@ -11,7 +11,11 @@ struct DYFeedPager<Page: View>: View {
     @Binding var scrollEndTask: Task<Void, Never>?
     /// 默认界面打开左右分栏搜索时要跟随窗格宽度，只锁高度；经典布局整页铺满。
     var pageAxes: Axis.Set = .vertical
-    @ViewBuilder let page: (DYAweme) -> Page
+    /// 第二个参数 = 这一条是不是当前条，用分页器自己读到的 currentID 算。
+    /// 别在外层闭包里拿外层的 currentID 比：外层 body 没直接读 currentID，SwiftUI 不会因它变化重算外层，
+    /// 闭包里捕获的是旧值（1.6.2 冷启动当前条一直是 nil → 没有一页 active → 视频全不播；
+    /// 以前靠启动弹「有新版本/更新内容」顺带重算外层盖住了）。
+    @ViewBuilder let page: (DYAweme, Bool) -> Page
     /// 系统「减少动态效果」时分页桥不接管，只能靠 scrollPosition 切当前条
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -31,7 +35,7 @@ struct DYFeedPager<Page: View>: View {
     private var pager: some View {
         ScrollView(.vertical) {
             // 非 Lazy：当前前 1 后 2 条提前挂真页面（第一帧已就绪），其余是轻量占位，见 DYPagerWindow
-            DYPagerStack(items: items, currentID: currentID, page: page, pageAxes: pageAxes)
+            DYPagerStack(items: items, currentID: currentID, page: { item in page(item, item.id == currentID) }, pageAxes: pageAxes)
             .scrollTargetLayout()
             // 固定「更快」收尾（0.10s）；系统开了「减少动态效果」时自动退回系统分页。
             .background(DYPagingSpeedBridge(ids: items.map(\.id), currentID: $currentID))

@@ -129,7 +129,10 @@ final class DYAmbientFrameView: UIView {
             .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.85])
         guard let cg = Self.ci.createCGImage(blurred, from: small.extent) else { return }
         imageView.image = UIImage(cgImage: cg)
-        DYDeskLightHub.publish(cg)
+        // 桌面投影（与 GuoDuo 同一套：按亮度出光、近清远糊、远端扩散、垫环境光；只有投影视图在屏幕上时才算）
+        if DYDeskLightHub.wanted, let proj = DYDeskProjection.render(src, ci: Self.ci) {
+            DYDeskLightHub.publish(proj.image, glow: proj.glow, aspect: src.extent.width / max(src.extent.height, 1))
+        }
         if imageView.alpha == 0 {
             UIView.animate(withDuration: 0.25) { self.imageView.alpha = 1; self.dimView.alpha = 1 }
         }

@@ -19,13 +19,18 @@ struct DYNotice: Identifiable, Codable, Equatable {
     /// 评论通知：这条评论的 cid；是楼中楼时 parentCid = 一级评论 cid（回复/定位都要用）
     var cid: String? = nil
     var parentCid: String? = nil
+    /// 一级评论 cid；旧缓存里一级评论的 parentCid 存成了作品 id（见 noticeJS），这里一律当成没有
+    var threadParent: String? {
+        guard let p = parentCid, !p.isEmpty, p != awemeID, p != cid else { return nil }
+        return p
+    }
     /// 被回复的那条（通常是我的评论）原文，列表里灰字引用
     var quote: String? = nil
 
     var isComment: Bool { type == 31 && (cid?.isEmpty == false) && (awemeID?.isEmpty == false) }
     var commentFocus: DYCommentFocus? {
         guard isComment, let cid, let awemeID else { return nil }
-        return DYCommentFocus(awemeID: awemeID, cid: cid, parentCid: parentCid)
+        return DYCommentFocus(awemeID: awemeID, cid: cid, parentCid: threadParent)
     }
 }
 
@@ -34,6 +39,8 @@ struct DYCommentFocus: Equatable, Hashable {
     let awemeID: String
     let cid: String
     let parentCid: String?
+    /// 通知里点「回复」：定位到这条后直接进入「回复 @它」（和在评论区里点它一样，走同一套发送）
+    var startReply = false
 }
 
 struct DYNoticePage: Decodable {
@@ -213,7 +220,11 @@ extension DouyinBridge {
         // 楼中楼：reply_id = 一级评论 cid（网页 comment/list/reply 实测）；一级评论为 '0'
         // 通知里的 comment 没有 reply_id，楼中楼的一级评论在 n.comment.parent_id（一级评论时为 0 或等于自身）
         const pick = v => (v !== undefined && v !== null && String(v) !== '0' && String(v) !== '') ? String(v) : null;
-        const rid = pick(n.comment.parent_id) || pick(c.reply_id) || pick(n.comment.level1_comment && n.comment.level1_comment.cid);
+        // ⚠️ 一级评论的通知里 parent_id 是「作品 id」不是评论 id（11-19 真机：parent=aweme_id），
+        // 当成楼中楼去回复 → reply_id=作品 id，抖音回 code=0 但这条挂到不存在的楼下，谁都看不到
+        const awemeOf = (c.aweme_id && String(c.aweme_id)) || (n.comment.aweme && n.comment.aweme.aweme_id && String(n.comment.aweme.aweme_id)) || (n.aweme_id ? String(n.aweme_id) : '');
+        const notAweme = v => { const x = pick(v); return x && x !== awemeOf ? x : null; };
+        const rid = pick(c.reply_id) || pick(n.comment.level1_comment && n.comment.level1_comment.cid) || notAweme(n.comment.parent_id);
         parentCid = rid && rid !== cid ? rid : null;
         quote = (n.comment.reply_comment && n.comment.reply_comment.text) || null;
         action = parentCid ? '回复了你的评论' : '评论了你';

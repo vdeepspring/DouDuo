@@ -45,6 +45,16 @@ class MenuPolicyTests(unittest.TestCase):
                       "shortRatio", "isShort(", "wantedShort"):
             self.assertNotIn(token, FEED)
 
+    def test_module_menu_has_messages_and_mine_entries(self):
+        menu = block(FEED, "private func minimalModuleButton")
+        tail = menu.split('minimalMenuRow("搜索"', 1)[1]
+        self.assertIn('minimalMenuRow("信息"', tail)
+        self.assertIn('"douyin.module.messages"', tail)
+        self.assertIn('minimalMenuRow("我的"', tail)
+        info = tail.split('minimalMenuRow("信息"', 1)[1].split('minimalMenuRow("我的"', 1)[0]
+        self.assertIn("messagesStartOnMine = false; showMessages = true", info)
+        self.assertIn("noticeUnread > 0", info)
+
     def test_live_module_menu_actions_follow_the_selected_module(self):
         menu = block(FEED, "private func minimalModuleButton")
         live = menu.split("if tab == .live", 1)[1]
@@ -104,10 +114,11 @@ class MenuPolicyTests(unittest.TestCase):
         tabs = block(FEED, "enum DYTab:")
         for title in ("关注", "推荐", "直播"):
             self.assertIn('"' + title + '"', tabs)
-        self.assertNotIn('Text("信息")', top)
+        # 老板 2026-11-19：顶栏「信息」要有字，点它进信息页
+        self.assertIn('Text("信息")', top)
+        self.assertIn("showMessages = true", top)
         self.assertNotIn("myUser?.name", top)
         self.assertNotIn("showName", top)
-        self.assertIn('Image(systemName: "bubble.left.and.bubble.right")', top)
         self.assertIn("noticeUnread > 0", top)
         self.assertIn("theme.status.danger", top)
         self.assertEqual(top.count(".frame(minWidth: 44, minHeight: 44)"), 2)
@@ -135,7 +146,7 @@ class MenuPolicyTests(unittest.TestCase):
     def test_danmaku_settings_only_in_settings_screen(self):
         self.assertNotIn("struct DYDanmakuOptions", EXTRAS)
         screen = (ROOT / "DouDuo/DYSettingsScreen.swift").read_text()
-        for token in ('Toggle("显示弹幕"', 'Picker("弹幕密度"', 'Toggle("10 秒内重复去重"'):
+        for token in ('Toggle("显示弹幕"', 'Picker("弹幕密度"', 'Toggle("10 秒内重复弹幕去重"'):
             self.assertIn(token, screen)
 
     def test_settings_paths_and_duration_preferences(self):
@@ -155,9 +166,13 @@ class MenuPolicyTests(unittest.TestCase):
         self.assertLess(classic.index("$bgPlay"), classic.index("DYSettingsButton()"))
         self.assertNotIn("struct DYChromeModePicker", FEED)
         screen = (ROOT / "DouDuo/DYSettingsScreen.swift").read_text()
-        for section in ('Label("刷新推荐"', 'Section("界面")', 'Text("播放")', 'Text("内容偏好")', 'Text("弹幕")',
-                        'Text("缓存")', 'Section("账号")', 'Section("关于")'):
+        # 老板 11-19 重排：界面 → 播放与弹幕 → 推荐与内容 → 评论与私信 → 缓存与离线 → 账号 → 关于
+        order = ['Text("界面")', 'Text("播放与弹幕")', 'Text("推荐与内容")', 'Text("评论与私信")',
+                 'Text("缓存与离线")', 'Text("账号")', 'Text("关于")']
+        for section in ['Label("刷新推荐"'] + order:
             self.assertIn(section, screen)
+        idx = [screen.index(t) for t in order]
+        self.assertEqual(idx, sorted(idx), "设置分组顺序")
         # 2026-11-14 老板定：表层菜单已有的（静音 / 铺满 / 听书 / 自动连播）设置页不重复；短视频占比删除
         for gone in ('"douyin_autoplay_v1"', '"douyin_muted_v1"', '"douyin_autofit_v1"', '"douyin_bg_play_v1"',
                      "short_ratio", "短视频占比", "ratioChoices", 'Toggle("静音"', 'Toggle("自动连播"', 'Toggle("铺满宽度',

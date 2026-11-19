@@ -50,6 +50,9 @@ struct DYAppLoginScreen: View {
         }
         .onChange(of: page.loggedIn) { _, ok in if ok { dismiss() } }
         .onChange(of: page.askScan) { _, ask in if ask { mode = .qr } }
+        // 登录页里换 cookie 是预期内的，登录守护别弹
+        .onAppear { DYSessionWatch.shared.loginScreenOpen = true }
+        .onDisappear { DYSessionWatch.shared.loginScreenOpen = false }
     }
 
     private var form: some View {
@@ -190,6 +193,7 @@ final class DYLoginPage: NSObject, ObservableObject, WKNavigationDelegate {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()   // 跟签名页 / 网页版共用登录态
         DYTrustLogin.install(in: cfg)       // 登录成功后的「是否保存登录信息？」默认点「保存」
+        DYKeyStateProbe.install(in: cfg, tag: "login")
         web = WKWebView(frame: CGRect(x: 0, y: 0, width: 420, height: 760), configuration: cfg)
         web.customUserAgent = DouyinWeb.userAgent
         super.init()

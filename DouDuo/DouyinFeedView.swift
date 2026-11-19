@@ -116,6 +116,9 @@ struct DYComment: Identifiable, Decodable, Equatable {
     var pinned: [DYComment]? = nil
     /// 楼中楼被 insert_ids 直接顶到一级列表时，它所属的一级评论 cid（回复它要用）
     var parent: String? = nil
+    /// 稳定作者 UID 与精确被回复目标；缺字段时不得猜测送达。
+    var uid: String? = nil
+    var replyTo: String? = nil
 }
 
 /// 评论里的一张图：缩略图用于列表，原图用于点开全屏
@@ -209,6 +212,13 @@ enum DYError: LocalizedError {
 @MainActor
 final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     @Published private(set) var ready = false
+    /// 签名完成：签名页已加载、安全 SDK 已接管 XHR+fetch、本页登录凭证已刷新（/passport/token/beat/web）。
+    /// 老板 2026-11-19：刚启动 5 秒就发评论 → 403(凭证校验 1101) 并被抖音作废登录；没完成前不许发评论。
+    @Published private(set) var signReady = false
+    /// 这一轮签名从什么时候开始（倒计时用）
+    @Published private(set) var signStartedAt = Date()
+    private var signGen = 0
+    private var signPreparing = false
     /// 只在 `reload` 推进。界面用它清掉上一账号的关注直播，不代表登录态本身。
     @Published private(set) var followSession = 0
     @Published private(set) var authorFollowStates: [String: Bool] = [:]
@@ -238,6 +248,9 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         cfg.allowsPictureInPictureMediaPlayback = false
         cfg.userContentController.addUserScript(WKUserScript(source: Self.noMediaJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         DYTrustLogin.install(in: cfg)   // 签名页上弹「是否保存登录信息？」也默认点「保存」
+        DYLogoutBlock.install(in: cfg)  // 后台签名页无人操作，不许它自己调抖音登出
+        DYKeyStateProbe.install(in: cfg, tag: "signer")
+        cfg.userContentController.addUserScript(WKUserScript(source: Self.beatWatchJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         web = WKWebView(frame: CGRect(x: 0, y: 0, width: 1200, height: 800), configuration: cfg)
         web.customUserAgent = DouyinWeb.userAgent
         super.init()
@@ -250,6 +263,15 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         // Layout fixtures must not bootstrap the live website or share its request budget.
         if ProcessInfo.processInfo.environment["DOUDUO_HASHTAG_FIXTURE"] == "1" {
             ready = true
+            // UI 测试：DOUDUO_SIGN_DELAY=<秒> 模拟签名还没完成，到点自动完成
+            if let d = ProcessInfo.processInfo.environment["DOUDUO_SIGN_DELAY"].flatMap(Double.init), d > 0 {
+                signReady = false
+                signStartedAt = Date()
+                UserDefaults.standard.set(d, forKey: Self.signSecsKey)
+                Task { @MainActor in try? await Task.sleep(for: .seconds(d)); self.signReady = true; DYLiveModel.log("DDSIGN ready fixture") }
+            } else {
+                signReady = true
+            }
             return
         }
         #endif
@@ -257,6 +279,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         followSessionCache.invalidate()
         followSession = followSessionCache.generation
         ready = false
+        markSignPending()
         web.load(URLRequest(url: startURL))
         liveContext?.reload()
     }
@@ -293,8 +316,20 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
                     }
                 }
                 #endif
+                #if DEBUG
+                if let aw = ProcessInfo.processInfo.environment["DOUDUO_COMPOSER_PROBE"], !aw.isEmpty, self.startURL.host == "www.douyin.com", !Self.composerProbeStarted {
+                    Self.composerProbeStarted = true
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        let r = await DYWebComposer.shared.probe(awemeID: aw, host: self.web.superview)
+                        DYLiveModel.log("DDCOMPOSERPROBE \(r)")
+                    }
+                }
+                #endif
+                let gen = self.signGen
                 let hooked = await self.waitWriteHooks(seconds: 10)
                 let state = await self.writeHookState()
+                if hooked { await self.finishSigning(gen: gen) }
                 self.web.evaluateJavaScript(Self.quietPageJS) { r, _ in
                     DYLiveModel.log("DDQUIET \(r.map { String(describing: $0) } ?? "nil") hooked=\(hooked) \(state) \(self.startURL.host ?? "")")
                 }
@@ -304,7 +339,66 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
 
     #if DEBUG
     private static var hookProbeStarted = false
+    private static var composerProbeStarted = false
     #endif
+
+    /// 记下本页登录凭证刷新（/passport/token/beat/web）完成的时间。只读 Resource Timing，不碰 XHR/fetch
+    /// （否则会干扰「SDK 是否接管」的判断），不记 URL 参数和内容。
+    static let beatWatchJS = #"""
+    (() => { try { window.__ddBeatAt = 0;
+      const seen = l => { for (const e of l) if (/\/passport\/token\/beat\/web/.test(e.name) && e.responseEnd > 0) window.__ddBeatAt = Date.now(); };
+      new PerformanceObserver(x => seen(x.getEntries())).observe({ type: 'resource', buffered: true }); } catch (e) {} })();
+    """#
+
+    private func markSignPending() {
+        signGen += 1
+        signStartedAt = Date()
+        if signReady { signReady = false }
+    }
+
+    /// 实测的签名耗时（秒，平滑后），给「约 N 秒」用；没有记录时按 12 秒估
+    static let signSecsKey = "douduo_sign_secs_v1"
+    var signEstimateSecs: Double {
+        let v = UserDefaults.standard.double(forKey: Self.signSecsKey)
+        return v > 0 ? v : 12
+    }
+    /// 还要等几秒（至少 1；超过估计时返回 nil = 马上就好）
+    func signSecondsLeft(now: Date = Date()) -> Int? {
+        let left = signEstimateSecs - now.timeIntervalSince(signStartedAt)
+        return left > 0.5 ? Int(left.rounded(.up)) : nil
+    }
+
+    /// 签名 SDK 挂好后，再等本页登录凭证刷新完（最多 12 秒，没等到也放行并记日志）
+    private func finishSigning(gen: Int) async {
+        guard startURL.host == "www.douyin.com", gen == signGen, !signReady else { return }
+        let t0 = Date()
+        var beat = false
+        while Date().timeIntervalSince(t0) < 12, gen == signGen {
+            let at = (try? await web.evaluateJavaScript("window.__ddBeatAt || 0")) as? Double ?? 0
+            if at > 0 { beat = true; break }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        guard gen == signGen else { return }
+        if beat { try? await Task.sleep(nanoseconds: 500_000_000) }  // 给 SDK 一点时间把新凭证落盘
+        guard gen == signGen, !signReady else { return }
+        signReady = true
+        // 记下这次从开页到签名完成用了多久，下次的「约 N 秒」更准（新旧各半，限 3–30 秒）
+        let took = min(max(Date().timeIntervalSince(signStartedAt), 3), 30)
+        let old = UserDefaults.standard.double(forKey: Self.signSecsKey)
+        UserDefaults.standard.set(old > 0 ? (old + took) / 2 : took, forKey: Self.signSecsKey)
+        DYLiveModel.log("DDSIGN ready took=\(Int(took))s beat=\(beat ? 1 : 0) waitMs=\(Int(Date().timeIntervalSince(t0) * 1000))")
+    }
+
+    /// 用户点发送时签名还没完成：在后台把签名页准备好（挂钩没装上就重开），完成后 signReady 变 true
+    func prepareSigning() async {
+        guard !signReady, !signPreparing else { return }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DOUDUO_HASHTAG_FIXTURE"] == "1" { return }
+        #endif
+        signPreparing = true
+        defer { signPreparing = false }
+        if await ensureWriteReady() { await finishSigning(gen: signGen) }
+    }
 
     /// 页面安全 SDK 是否已同时接管 XHR 和 fetch（写接口签名靠它）
     private static let hookStateJS = #"""
@@ -341,6 +435,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
             DYLiveModel.log("DDSEND rearm round=\(round) state=\(await writeHookState())")
             // 只重开签名页本身：不动直播页、不清关注缓存（reload() 会让界面以为换了账号）
             ready = false
+            markSignPending()
             web.load(URLRequest(url: startURL))
             await waitReady()
             if await waitWriteHooks(seconds: 8) {
@@ -413,6 +508,9 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     /// 自己的 sec_uid（拉「喜欢」列表要用）
     var selfSecCache: String?
 
+    /// 后台「真人方式」评论页也用同一份：只要评论区，不要视频声音和全屏
+    static var composerNoMediaJS: String { noMediaJS }
+
     private static let noMediaJS = """
     (() => {
       const P = HTMLMediaElement.prototype;
@@ -439,9 +537,10 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     func fetchFeed() async throws -> (items: [DYAweme], hasMore: Bool) {
         refreshIndex += 1
         let args: [String: Any] = ["refresh": String(refreshIndex), "install": String(Self.installTime),
-                                   "pull": refreshIndex <= 2 ? "0" : "2"]
+                                   "pull": refreshIndex <= 2 ? "0" : "2",
+                                   "client": DYContentPrefs.feedIsClient ? "1" : "0"]
         let p = try JSONDecoder().decode(DYFeedPage.self, from: try await call(Self.tabFeedJS, args: args))
-        DYLiveModel.log("DDFEED idx=\(refreshIndex) \(p.diag ?? "-") more=\(p.hasMore) msg=\(p.msg ?? "-")")
+        DYLiveModel.log("DDFEED idx=\(refreshIndex) client=\(DYContentPrefs.feedIsClient ? 1 : 0) \(p.diag ?? "-") more=\(p.hasMore) msg=\(p.msg ?? "-")")
         guard p.status == 200 else { throw DYError.blocked("HTTP \(p.status)") }
         if p.items.isEmpty, let m = p.msg, !m.isEmpty { throw DYError.blocked(m) }
         return (p.items, p.hasMore)
@@ -875,7 +974,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       const urls = new Set(streams);
       return Object.fromEntries(Object.entries(su.flv_pull_url || {}).filter(([_, u]) => urls.has(u)));
     };
-    const req = (method, path, body) => new Promise(ok => {
+    const req = (method, path, body, headers = {}) => new Promise(ok => {
       const x = new XMLHttpRequest();
       let done = false;
       const fin = r => { if (!done) { done = true; ok(r) } };
@@ -884,9 +983,12 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       // 硬超时：页面安全 SDK 会接管 XHR，部分接口它压着不放、x.timeout 也不触发 → Promise 永远挂死
       setTimeout(() => { try { x.abort() } catch (e) {} fin({ s: -3, t: '' }) }, 14000);
       x.open(method, path); x.withCredentials = true;
-      x.setRequestHeader('Accept', 'application/json, text/plain, */*');
-      if (method === 'POST') x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
-      x.onload = () => fin({ s: x.status, t: x.responseText, u: String(x.responseURL || '') }); x.onerror = () => fin({ s: -1, t: '' });
+      const extraHeaders = Object.entries(headers || {});
+      const hasHeader = name => extraHeaders.some(([key]) => key.toLowerCase() === name);
+      if (!hasHeader('accept')) x.setRequestHeader('Accept', 'application/json, text/plain, */*');
+      if (method === 'POST' && !hasHeader('content-type')) x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+      for (const [name, value] of extraHeaders) x.setRequestHeader(name, String(value));
+      x.onload = () => { let h = ''; try { h = '\n' + (x.getAllResponseHeaders() || ''); } catch (e) {} fin({ s: x.status, t: x.responseText, u: String(x.responseURL || ''), h }); }; x.onerror = () => fin({ s: -1, t: '' });
       x.send(body || null);
     });
     const base = { device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web', pc_client_type: '1', pc_libra_divert: 'Mac',
@@ -974,8 +1076,9 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     /// 推荐流：网页版首页「推荐」竖屏流（tab/feed）。
     /// 不用 module/feed（module_id=3003101）：那是网页「精选」，横屏长视频多、偏大众，跟 App 推荐差很远（2026-11 老板实测确认）。
     private static let tabFeedJS = #"""
+    // is_client：实验开关（设置 →「推荐与内容」），true = 自称抖音电脑客户端，看推荐是否更接近手机 App
     const P = Object.assign({}, base, { count: '10', refresh_index: refresh, video_type_select: '1',
-      aweme_pc_rec_raw_data: JSON.stringify({ is_client: false, ff_danmaku_status: 0, danmaku_switch_status: 0 }),
+      aweme_pc_rec_raw_data: JSON.stringify({ is_client: client === '1', ff_danmaku_status: 0, danmaku_switch_status: 0 }),
       globalwid: '', pull_type: pull, min_window: '0', free_right: '0', ug_source: '', creative_id: '' });
     const r = await req('GET', '/aweme/v1/web/tab/feed/?' + new URLSearchParams(P).toString());
     const d = parse(r.t);
@@ -1020,11 +1123,15 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       const an = ddImg(s.animate_url) || st;
       return { thumb: st.u, full: an.u, w: s.width || st.w, h: s.height || st.h };
     };
+    const ddStableID = v => typeof v === 'string' ? (v && v !== '0' ? v : null) : Number.isSafeInteger(v) && v > 0 ? String(v) : null;
+    const ddCommentID = c => [c.cid, c.user && c.user.uid, c.reply_id, c.reply_to_reply_id].some(v => typeof v === 'number' && !Number.isSafeInteger(v)) ? '' : ddStableID(c.cid) || '';
     const one = c => ({
-      id: String(c.cid), text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
+      id: ddCommentID(c), text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
       digg: c.digg_count || 0, time: c.create_time || 0, replies: c.reply_comment_total || 0, ip: c.ip_label || null, userDigged: c.user_digged ? 1 : 0,
       images: ddImages(c), sticker: ddSticker(c),
-      parent: (c.reply_id && String(c.reply_id) !== '0') ? String(c.reply_id) : null
+      parent: ddStableID(c.reply_id),
+      uid: ddStableID(c.user && c.user.uid),
+      replyTo: ddStableID(c.reply_to_reply_id)
     });
     // insert_ids 定位楼中楼时，那条回复挂在一级评论的 reply_comment 里
     const items = (d.comments || []).map(c => Object.assign(one(c), (ins && c.reply_comment && c.reply_comment.length) ? { pinned: c.reply_comment.map(r => Object.assign(one(r), { replies: 0 })) } : {}));
@@ -1452,6 +1559,8 @@ private struct DYFeedHostFrameKey: PreferenceKey {
 extension EnvironmentValues {
     @Entry var duoSystemBars = false
     @Entry var dyOfflineVideoPlayback: DYOfflinePlaybackContext? = nil
+    /// 全屏播放器打开时的遮罩层级（见 DDPlayback.coverLevels）；首页为 0
+    @Entry var ddCoverLevel = 0
     @Entry var duoInlineVideoNavigation = false
     @Entry var duoContentInsets = EdgeInsets()
     @Entry var duoVisibleVideo: Binding<DYAweme?> = .constant(nil)
@@ -1503,6 +1612,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
     /// App 内登录页（关注页「登录」等入口）
     @State private var showAppLogin = false
     @State private var showSettings = false
+    @State private var settingsCoverID = UUID()
     @State var tab: DYTab = {
         let e = ProcessInfo.processInfo.environment
         if e["DOUDUO_STARTLIVE"] == "1" { return .live }
@@ -1520,7 +1630,6 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
     @State private var myUser: DYUser?
     @State private var authorTarget: DYAweme.Author?
     @Environment(\.horizontalSizeClass) private var hSize
-    @State private var pendingUpdate: DDUpdate?
     @State private var showMessages = false
     /// 从模块菜单「我的」打开信息页时直接停在「我的」
     @State private var messagesStartOnMine = false
@@ -1796,7 +1905,11 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
         .task(id: "\(blockedHashtags)|\(shortMax)") { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
         .onChange(of: feed.portraitOnly) { _, _ in remixUpcoming() }
-        .onDisappear { live.stop(); preloader.clear() }
+        .onDisappear {
+            live.stop()
+            preloader.clear()
+            DDPlayback.shared.endSettingsCover(settingsCoverID)
+        }
     }
 
     /// 登录页 / 网页关掉后：重开签名页重新读登录态，再刷推荐，推荐流跟着账号走
@@ -1813,7 +1926,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
         .onChange(of: showComments) { _, shown in if shown { searchSession = nil } }
         .environment(\.dyOpenSettings, { showSettings = true })
         .sheet(isPresented: $showSettings, onDismiss: {
-            DDPlayback.shared.releaseCover()
+            DDPlayback.shared.endSettingsCover(settingsCoverID)
             if feed.offlinePlayback { Task { await updateOfflineFeed(true, refresh: true) } }
         }) {
             DYSettingsScreen(onOpenWeb: { web = DYWebTarget(url: DouyinWeb.home) },
@@ -1822,7 +1935,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                              offlineCandidateSource: { try await offlineCandidates($0) },
                              offlineInteractionBridge: bridge)
                 // 老板要求：进设置页视频也停（以前只有信息页停）
-                .onAppear { DDPlayback.shared.pauseAll(reason: .cover) }
+                .onAppear { DDPlayback.shared.beginSettingsCover(settingsCoverID) }
         }
         .fullScreenCover(item: $web, onDismiss: {
             // 网页里可能登录 / 过了验证：重开签名页，先重新读登录态，再刷推荐
@@ -1878,22 +1991,8 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             }
         }
         .modifier(DYDMBannerModifier(messagesVisible: showMessages, openMessages: { showMessages = true }))
-        .task {
-            // 启动查一次新版本；关掉后同一版本不再提示
-            if let u = await DDUpdateChecker.check() { pendingUpdate = u }
-        }
-        .alert("有新版本", isPresented: Binding(get: { pendingUpdate != nil }, set: { if !$0 { if let u = pendingUpdate { DDUpdateChecker.dismiss(u) }; pendingUpdate = nil } })) {
-            Button("去 GitHub 更新") {
-                if let u = pendingUpdate { DDUpdateChecker.dismiss(u); DDUpdateChecker.open(u) }
-                pendingUpdate = nil
-            }
-            Button("关闭", role: .cancel) {
-                if let u = pendingUpdate { DDUpdateChecker.dismiss(u) }
-                pendingUpdate = nil
-            }
-        } message: {
-            Text("新版本 \(pendingUpdate?.version ?? "")（当前 \(DDUpdateChecker.currentVersion)）\n去 GitHub 下载新版，重新签名安装即可，登录态会保留。")
-        }
+        // 启动查新版本 / 刚升级完显示一次本次更新内容
+        .modifier(DDReleaseNotesModifier())
     }
 
     @ViewBuilder
@@ -1968,6 +2067,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
     /// 点页签只切页，不再顺手刷新（点顶部会误触成「刷新视频」）。
     /// 要换一批推荐走「更多 → 刷新推荐」。
     private func selectTab(_ target: DYTab) {
+        DYLiveModel.log("DDTAB select target=\(target) from=\(tab) screen=upstream")
         guard tab != target else { return }
         if target != .live {
             queuedLiveAction = nil
@@ -2089,11 +2189,12 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                 .accessibilityIdentifier("douyin.channel.\(t == .follow ? "follow" : t == .recommend ? "recommend" : "live")")
                 .accessibilityValue(t == .recommend && refreshing ? "正在刷新" : tab == t ? "已选择" : "")
             }
-            // 消息只留图标，未读红点仍独立显示。
+            // 「信息」：带字的入口（老板 2026-11-19 要加回来），跟 tab 同款字体；未读红点独立显示
             Button { showMessages = true } label: {
-                Image(systemName: "bubble.left.and.bubble.right")
+                Text("信息")
                     .font(.headline.weight(.medium))
                     .foregroundStyle(theme.media.onMedia.color(for: scheme).opacity(0.62))
+                    .lineLimit(1).fixedSize()
                 .padding(.horizontal, hPad)
                 .padding(.vertical, 14)
                 .frame(minWidth: 44, minHeight: 44)
@@ -2108,7 +2209,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                 }
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("消息")
+            .accessibilityLabel("信息")
             .accessibilityIdentifier("douyin.messages.top")
 
             // 「我的」：独立按钮（不属于 tab 切换）
@@ -2238,12 +2339,16 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
 
     private func queueLiveModule(_ action: DYLiveModuleRequest.Action) {
         queuedLiveAction = action
+        // 菜单行先无动画收起、下一轮才跑动作（fc4acc7）：收起时的 onChange 已经跑过了，
+        // 这里不立刻发出去就要等下次开关菜单才生效 = 老板 11-19「我的关注 / 发现更多要点两次」。
+        if !minimalMenuOpen { publishQueuedLiveModule() }
     }
 
     private func publishQueuedLiveModule() {
         guard let action = queuedLiveAction else { return }
         queuedLiveAction = nil
         let token = (liveModuleRequest?.token ?? 0) + 1
+        DYLiveModel.log("DDLIVEMODULE publish \(action) token=\(token) menuOpen=\(minimalMenuOpen)")
         liveModuleRequest = DYLiveModuleRequest(token: token, action: action)
     }
 
@@ -2260,6 +2365,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                     else if !minimalMenuOpen { withAnimation(.easeOut(duration: 0.15)) { peek.on = false } }
                 },
                 onTap: {
+                    DYLiveModel.log("DDTAB module-open")
                     minimalMenuOpen = true
                     if chromeMode.hidesInfo { peek.on = true }
                 }))
@@ -2285,8 +2391,11 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                     }
                     Divider().padding(.vertical, 4)
                     minimalMenuRow("搜索", "magnifyingglass", id: "douyin.module.search") { openSearch() }
-                    // 信息与我的已合成一页：只留一个入口「我的」，未读红点挂在这里
-                    minimalMenuRow("我的", "person.crop.circle", badge: noticeUnread > 0, id: "douyin.module.mine") {
+                    // 老板 2026-11-19：「信息」入口加回来，点它直接进信息页；「我的」照旧进我的页（同一页的两个分栏）
+                    minimalMenuRow("信息", "bubble.left.and.bubble.right", badge: noticeUnread > 0, id: "douyin.module.messages") {
+                        messagesStartOnMine = false; showMessages = true
+                    }
+                    minimalMenuRow("我的", "person.crop.circle", id: "douyin.module.mine") {
                         messagesStartOnMine = true; showMessages = true
                     }
                 }
@@ -2313,6 +2422,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             var t = Transaction()
             t.disablesAnimations = true
             withTransaction(t) { minimalMenuOpen = false }
+            DYLiveModel.log("DDTAB menu-row \(id)")
             DispatchQueue.main.async { action() }
         } label: {
             HStack(spacing: 10) {
@@ -2359,17 +2469,17 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             } else {
                 // 四种界面共用同一个分页器（含「更快」收尾），见 DYFeedPager.swift
                 DYFeedPager(items: feed.items, currentID: $currentID, scrollID: $scrollID,
-                            userScrolling: $userScrolling, scrollEndTask: $scrollEndTask) { item in
-                    page(for: item)
+                            userScrolling: $userScrolling, scrollEndTask: $scrollEndTask) { item, isCurrentItem in
+                    page(for: item, isCurrentItem: isCurrentItem)
                 }
             }
         }
     }
 
     /// 单页构造拆成独立函数：参数太多，写在 ForEach 里会让类型检查超时。
-    private func page(for item: DYAweme) -> some View {
+    private func page(for item: DYAweme, isCurrentItem: Bool) -> some View {
         let extras = AnyView(moreExtrasMenu(item))
-        let active = item.id == currentID && web == nil && tab == .recommend && !overlayOpen && !showSettings
+        let active = isCurrentItem && web == nil && tab == .recommend && !overlayOpen && !showSettings
         return DYVideoPage(item: item,
                            isCurrent: active,
                            insets: insets,
@@ -2750,6 +2860,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
     /// App 内登录页（关注页「登录」等入口）
     @State private var showAppLogin = false
     @State private var showSettings = false
+    @State private var settingsCoverID = UUID()
     @State var tab: DYTab = {
         let e = ProcessInfo.processInfo.environment
         if e["DOUDUO_STARTLIVE"] == "1" { return .live }
@@ -2790,7 +2901,6 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
     @State private var restoredTabPauseApplied = false
     @StateObject private var followList = DYPagedModelHolder()
     @State private var followCurrentID: String?
-    @State private var pendingUpdate: DDUpdate?
     private var showMessages: Bool {
         get { mainTab == .messages }
         nonmutating set { mainTab = newValue ? .messages : .home }
@@ -3004,10 +3114,14 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         .task(id: "\(blockedHashtags)|\(shortMax)") { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
         .onChange(of: feed.portraitOnly) { _, _ in remixUpcoming() }
-        .onDisappear { live.stop(); preloader.clear() }
+        .onDisappear {
+            live.stop()
+            preloader.clear()
+            DDPlayback.shared.endSettingsCover(settingsCoverID)
+        }
         .environment(\.dyOpenSettings, { showSettings = true })
         .sheet(isPresented: $showSettings, onDismiss: {
-            DDPlayback.shared.releaseCover()
+            DDPlayback.shared.endSettingsCover(settingsCoverID)
             if feed.offlinePlayback { Task { await updateOfflineFeed(true, refresh: true) } }
         }) {
             DYSettingsScreen(onOpenWeb: { web = DYWebTarget(url: DouyinWeb.home) },
@@ -3016,7 +3130,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                              offlineCandidateSource: { try await offlineCandidates($0) },
                              offlineInteractionBridge: bridge)
                 // 老板要求：进设置页视频也停（以前只有信息页停）
-                .onAppear { DDPlayback.shared.pauseAll(reason: .cover) }
+                .onAppear { DDPlayback.shared.beginSettingsCover(settingsCoverID) }
         }
         .fullScreenCover(item: $web, onDismiss: {
             // 网页里可能登录 / 过了验证：重开签名页，先重新读登录态，再刷推荐
@@ -3025,6 +3139,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             DouyinWebScreen(start: t.url)
         }
         .sheet(isPresented: $showAppLogin, onDismiss: { reloadAfterLogin() }) { DYAppLoginScreen() }
+        .modifier(DYSessionLostAlert { showAppLogin = true })
         .onChange(of: bridge.followSession) { _, _ in
             followList.resetModel()
             followCurrentID = nil
@@ -3052,22 +3167,8 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             if !open { Task { await refreshNoticeUnread() } }
         }
         .modifier(DYDMBannerModifier(messagesVisible: showMessages, openMessages: { showMessages = true }))
-        .task {
-            // 启动查一次新版本；关掉后同一版本不再提示
-            if let u = await DDUpdateChecker.check() { pendingUpdate = u }
-        }
-        .alert("有新版本", isPresented: Binding(get: { pendingUpdate != nil }, set: { if !$0 { if let u = pendingUpdate { DDUpdateChecker.dismiss(u) }; pendingUpdate = nil } })) {
-            Button("去 GitHub 更新") {
-                if let u = pendingUpdate { DDUpdateChecker.dismiss(u); DDUpdateChecker.open(u) }
-                pendingUpdate = nil
-            }
-            Button("关闭", role: .cancel) {
-                if let u = pendingUpdate { DDUpdateChecker.dismiss(u) }
-                pendingUpdate = nil
-            }
-        } message: {
-            Text("新版本 \(pendingUpdate?.version ?? "")（当前 \(DDUpdateChecker.currentVersion)）\n去 GitHub 下载新版，重新签名安装即可，登录态会保留。")
-        }
+        // 启动查新版本 / 刚升级完显示一次本次更新内容
+        .modifier(DDReleaseNotesModifier())
     }
 
     private var systemTabs: some View {
@@ -3230,6 +3331,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
     }
 
     private func selectTab(_ target: DYTab) {
+        DYLiveModel.log("DDTAB select target=\(target) from=\(tab) screen=classic settling=\(channelSettling) width=\(Int(channelWidth))")
         guard tab != target, !channelSettling else { return }
         showComments = false
         authorTarget = nil
@@ -3532,16 +3634,16 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                 // 四种界面共用同一个分页器（含「更快」收尾），见 DYFeedPager.swift
                 DYFeedPager(items: feed.items, currentID: $currentID, scrollID: $scrollID,
                             userScrolling: $userScrolling, scrollEndTask: $scrollEndTask,
-                            pageAxes: [.horizontal, .vertical]) { item in
-                    page(for: item, audible: audible, interactive: interactive)
+                            pageAxes: [.horizontal, .vertical]) { item, isCurrentItem in
+                    page(for: item, isCurrentItem: isCurrentItem, audible: audible, interactive: interactive)
                 }
             }
         }
     }
 
     /// 单页构造拆成独立函数：参数太多，写在 ForEach 里会让类型检查超时。
-    private func page(for item: DYAweme, audible: Bool, interactive: Bool) -> some View {
-        let active = audible && item.id == currentID && web == nil && !overlayOpen && !showSettings
+    private func page(for item: DYAweme, isCurrentItem: Bool, audible: Bool, interactive: Bool) -> some View {
+        let active = audible && isCurrentItem && web == nil && !overlayOpen && !showSettings
         return DYVideoPage(item: item,
                            isCurrent: active,
                            insets: insets,
@@ -4508,6 +4610,64 @@ enum DYFormat {
 
 // MARK: - 评论
 
+private struct DYHorizontalCommentCloseButton: UIViewRepresentable {
+    let tint: UIColor
+    let onClose: () -> Void
+
+    final class Anchor: UIView {
+        let button = UIButton(type: .system)
+        var onClose: (() -> Void)?
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            button.setImage(UIImage(systemName: "xmark",
+                                    withConfiguration: UIImage.SymbolConfiguration(textStyle: .subheadline, scale: .medium)),
+                            for: .normal)
+            button.accessibilityLabel = "关闭评论"
+            button.accessibilityIdentifier = "douyin.comments.close"
+            button.addAction(UIAction { [weak self] _ in self?.onClose?() }, for: .touchUpInside)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            positionButton()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            positionButton()
+        }
+
+        func positionButton() {
+            guard let window else {
+                button.removeFromSuperview()
+                return
+            }
+            // The split panel can draw above its host's tappable bounds.
+            // Keep the visual anchor in the header and receive touches at window level.
+            if button.superview !== window { window.addSubview(button) }
+            button.frame = convert(bounds, to: window)
+        }
+    }
+
+    func makeUIView(context: Context) -> Anchor {
+        Anchor(frame: .zero)
+    }
+
+    func updateUIView(_ anchor: Anchor, context: Context) {
+        anchor.onClose = onClose
+        anchor.button.tintColor = tint
+        anchor.positionButton()
+    }
+
+    static func dismantleUIView(_ anchor: Anchor, coordinator: ()) {
+        anchor.button.removeFromSuperview()
+    }
+}
+
 struct DYCommentPanel: View {
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
@@ -4551,10 +4711,18 @@ struct DYCommentPanel: View {
     @State private var atLoading = false
     @State private var atError: String?
     @State private var sending = false
+    /// 先上屏的本地评论（id 以 local- 开头）：发送中 / 失败可重发 / 结果不明
+    @State private var pending: [String: DYPendingSend] = [:]
+    /// 结果不明的那条要重发：先二次确认，免得发两条
+    @State private var confirmResend: String?
+    /// 草稿当前对应的「作品+回复目标」；切换目标时先把旧草稿存好再换
+    @State private var draftKey: String?
     @State private var sendErr: String?
     @State private var showRelogin = false
     /// 我自己的 sec_uid，用来认出哪些评论能删
     @State private var mySec: String?
+    @State private var myName: String?
+    @State private var myAvatar: String?
     @State private var deletingComment: DYComment?
     @State private var deletingParent: String?
     @State private var deleteBusy = false
@@ -4656,9 +4824,17 @@ struct DYCommentPanel: View {
             Group {
                 if horizontalStatus && !showsCaption {
                     HStack(spacing: 4) {
-                        closeButton
-                        commentTitle
-                        Spacer(minLength: 0)
+                        if let onClose {
+                            DYHorizontalCommentCloseButton(tint: UIColor(Color.themeTextPrimary), onClose: onClose)
+                                .frame(width: 44, height: 44)
+                        }
+                        HStack(spacing: 0) {
+                            commentTitle
+                            Spacer(minLength: 0)
+                        }
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                        .modifier(DYPanelDismissGesture(allowsSwipeRight: true, onClose: onClose))
                     }
                     .frame(minHeight: max(44, DYDuoMetrics.windowSafeTop))
                 } else {
@@ -4681,7 +4857,8 @@ struct DYCommentPanel: View {
         }
         .foregroundStyle(.themeTextPrimary)
         .contentShape(Rectangle())
-        .modifier(DYPanelDismissGesture(allowsSwipeRight: true, onClose: onClose))
+        .modifier(DYPanelDismissGesture(allowsSwipeRight: true,
+                                        onClose: horizontalStatus && !showsCaption ? nil : onClose))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("douyin.comments.header")
     }
@@ -4692,7 +4869,7 @@ struct DYCommentPanel: View {
         }
         .accessibilityValue(usesClassicComments ? "经典评论" : "上游评论")
         .dyReloginSheet(isPresented: $showRelogin, bridge: bridge) { ok in
-            sendErr = ok ? "已重新登录，再点一次发送" : "还没登录，登录后才能发评论"
+            sendErr = ok ? "已核验账号资料；评论权限未确认，草稿已保留，请勿连续重发" : "未完成账号核验；原登录和草稿未自动清理"
         }
     }
 
@@ -4785,6 +4962,7 @@ struct DYCommentPanel: View {
             DYRelatedSearchScreen(bridge: bridge, word: query.word)
         }
         .onDisappear { saveCommentPosition() }
+        .onReceive(bridge.$signReady) { ok in signDone(ok) }
     }
 
     private var classicBody: some View {
@@ -4802,6 +4980,7 @@ struct DYCommentPanel: View {
                 DYRelatedSearchScreen(bridge: bridge, word: query.word)
             }
             .onDisappear { saveCommentPosition() }
+            .onReceive(bridge.$signReady) { ok in signDone(ok) }
     }
 
     private var panelContent: some View {
@@ -4885,9 +5064,11 @@ struct DYCommentPanel: View {
     /// 关掉评论区：把已加载的评论、楼中楼和当前位置存下，同一条视频再打开时原样恢复
     private func saveCommentPosition() {
         guard focus == nil, !items.isEmpty else { return }
+        // 没确认的本地评论不进记忆：重开评论区时它会变成一条看起来已发出的普通评论
+        let keep = { (c: DYComment) in !DYPendingSend.isLocal(c.id) }
         DYCommentMemory.shared.put(aweme.id, .init(
-            items: items, cursor: cursor, hasMore: hasMore, total: total,
-            replies: replies, replyCursor: replyCursor, replyMore: replyMore,
+            items: items.filter(keep), cursor: cursor, hasMore: hasMore, total: total,
+            replies: replies.mapValues { $0.filter(keep) }, replyCursor: replyCursor, replyMore: replyMore,
             digged: digged, diggShown: diggShown, topID: topVisibleID))
         DYLiveModel.log("DDCOMMENTMEM save aweme=\(aweme.id.suffix(6)) n=\(items.count) top=\(topVisibleID?.suffix(6) ?? "-")")
     }
@@ -4949,8 +5130,13 @@ struct DYCommentPanel: View {
                         .buttonStyle(.plain).foregroundStyle(.themeTextSecondary)
                 }
             }
-            if let e = sendErr {
-                Text(e).font(.caption2).foregroundStyle(theme.status.danger.color(for: scheme))
+            if sendErr == Self.waitSignText {
+                DYSignWaitHint(bridge: bridge, color: theme.status.danger.color(for: scheme))
+                    .accessibilityIdentifier("douyin.comment.sendErr")
+            } else if let e = sendErr {
+                Text(e).font(.caption2)
+                    .foregroundStyle(e == Self.signDoneText ? theme.status.success.color(for: scheme) : theme.status.danger.color(for: scheme))
+                    .accessibilityIdentifier("douyin.comment.sendErr")
             }
             if imageLoading {
                 HStack(spacing: 8) {
@@ -5065,7 +5251,17 @@ struct DYCommentPanel: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("douyin.comments.composer")
         .task { await DYEmojiStore.shared.load(bridge: bridge) }
-        .task { if mySec == nil { mySec = try? await bridge.selfSecUid() } }
+        .task {
+            guard mySec == nil, let me = try? await bridge.selfProfile() else { return }
+            mySec = me.secUid; myName = me.name; myAvatar = me.avatar
+        }
+        .task { restoreDraft() }
+        .onChange(of: draft) { _, text in DYCommentDraftStore.save(currentDraftKey, text: text) }
+        .onChange(of: replyTo?.id) { _, _ in switchDraftTarget() }
+        .alert("这条可能已经发出去了", isPresented: Binding(get: { confirmResend != nil }, set: { if !$0 { confirmResend = nil } })) {
+            Button("仍要重发") { if let id = confirmResend { Task { await deliver(id) } }; confirmResend = nil }
+            Button("先不发", role: .cancel) { confirmResend = nil }
+        } message: { Text("抖音没给明确结果。重发前建议先下拉刷新看看评论区有没有这条，否则可能发两条。") }
         .alert("删除这条评论？", isPresented: Binding(get: { deletingComment != nil }, set: { if !$0 { deletingComment = nil } })) {
             Button("删除", role: .destructive) {
                 if let c = deletingComment { Task { await deleteComment(c, parent: deletingParent) } }
@@ -5151,6 +5347,25 @@ struct DYCommentPanel: View {
     }
 
     /// 有字或有图就能发（网页同款：带图时正文可以为空）
+    private var currentDraftKey: String {
+        DYCommentDraftStore.id(aweme.id, top: replyParent ?? replyTo?.id, to: replyParent == nil ? nil : replyTo?.id)
+    }
+
+    /// 打开评论区：把这条作品上次没发的草稿放回来
+    private func restoreDraft() {
+        draftKey = currentDraftKey
+        if draft.isEmpty, let saved = DYCommentDraftStore.load(currentDraftKey) { draft = saved }
+    }
+
+    /// 换了回复对象：旧目标的草稿已随打字存好；新目标有草稿就换上，没有就保留当前输入
+    private func switchDraftTarget() {
+        let key = currentDraftKey
+        guard key != draftKey else { return }
+        if let old = draftKey { DYCommentDraftStore.save(old, text: draft) }
+        draftKey = key
+        if let saved = DYCommentDraftStore.load(key) { draft = saved }
+    }
+
     private var hasCommentContent: Bool {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || imageDraft != nil
     }
@@ -5178,44 +5393,141 @@ struct DYCommentPanel: View {
         }
     }
 
+    /// 点发送：先把评论放进列表（发送中），输入框立刻清空可继续操作；结果回来再更新那一行。
     private func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard hasCommentContent, !sending, !imageLoading else { return }
-        sending = true
-        defer { sending = false }
-        do {
-            // 先传图再发评论；图传上去了但评论没发成时留着结果，再点发送不重传
-            var image: DYImageXUploadResult?
-            if let img = imageDraft {
-                if imageUploaded == nil {
-                    imageUploaded = try await bridge.uploadCommentImage(img.data, fileName: img.fileName, measured: img.measured)
-                }
-                image = imageUploaded
-            }
-            // 回楼中楼：reply_id 必须是一级评论，被回的那条放 reply_to_reply_id（网页同款）
-            let top = replyParent ?? replyTo?.id
-            let c = try await bridge.publishComment(aweme.id, text: text, replyID: top,
-                                                    replyToReplyID: replyParent == nil ? nil : replyTo?.id, image: image)
-            if let top {
-                replies[top, default: []].insert(c, at: 0)
-            } else {
-                items.insert(c, at: 0)
-                total += 1
-            }
-            draft = ""; replyTo = nil; replyParent = nil; sendErr = nil
-            clearCommentImage()
-            inputFocused = false
-        } catch is DYLoginExpired {
-            // 草稿留着：重新登录后再点一次发送
-            sendErr = "登录已失效（能浏览但发不了评论），正在打开登录…"
-            inputFocused = false
-            DYRelogin.start { showRelogin = true }
-        } catch {
-            sendErr = "发送失败：\(error.localizedDescription)"
+        guard bridge.signReady else { waitForSigning(); return }
+        // 回楼中楼：reply_id 必须是一级评论，被回的那条放 reply_to_reply_id（网页同款）
+        let top = replyParent ?? replyTo?.id
+        let to = replyParent == nil ? nil : replyTo?.id
+        let localID = DYPendingSend.prefix + UUID().uuidString
+        pending[localID] = DYPendingSend(text: text, imageDraft: imageDraft, uploaded: imageUploaded, top: top, replyTo: to,
+                                         replyTarget: replyTo, sentAt: Date().timeIntervalSince1970)
+        let local = DYComment(id: localID, text: text, name: myName ?? "我", avatar: myAvatar, digg: 0,
+                              time: Date().timeIntervalSince1970, replies: 0, ip: nil, sec: mySec,
+                              parent: top, replyTo: to)
+        if let top { replies[top, default: []].insert(local, at: 0) } else { items.insert(local, at: 0) }
+        DYCommentDraftStore.remove(currentDraftKey)
+        draft = ""; replyTo = nil; replyParent = nil; sendErr = nil
+        clearCommentImage()
+        inputFocused = false
+        await deliver(localID)
+    }
+
+    static let waitSignText = "等待签名完成才可以发送评论"
+    static let signDoneText = "签名完成，现在可以发送了"
+
+    /// 签名完成：等待提示换成「现在可以发送了」，3 秒后自己消失
+    private func signDone(_ ok: Bool) {
+        guard ok, sendErr == Self.waitSignText else { return }
+        sendErr = Self.signDoneText
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            if sendErr == Self.signDoneText { sendErr = nil }
         }
     }
 
+    /// 签名没完成：什么都不发、草稿原样留着，提示一句并在后台把签名准备好；完成后提示自动消失
+    private func waitForSigning() {
+        sendErr = Self.waitSignText
+        DYLiveModel.log("DDSIGN send-blocked waiting")
+        Task { await bridge.prepareSigning() }
+    }
+
+    /// 真正发出去。只对这一条本地评论负责：成功换成服务器那条，失败/不明就地标在那一行上。
+    private func deliver(_ localID: String) async {
+        guard bridge.signReady else { waitForSigning(); return }
+        guard var job = pending[localID] else { return }
+        job.state = .sending; pending[localID] = job
+        sending = true
+        defer { sending = false }
+        do {
+            // 先传图再发评论；图传上去了但评论没发成时留着结果，重发不重传
+            var image: DYImageXUploadResult?
+            if let img = job.imageDraft {
+                if job.uploaded == nil {
+                    do { job.uploaded = try await bridge.uploadCommentImage(img.data, fileName: img.fileName, measured: img.measured) }
+                    catch { throw DYError.bad("图片没传上去：\(error.localizedDescription)") }
+                    pending[localID]?.uploaded = job.uploaded
+                }
+                image = job.uploaded
+            }
+            let c = try await bridge.publishComment(aweme.id, text: job.text, replyID: job.top,
+                                                    replyToReplyID: job.replyTo, image: image)
+            replaceLocal(localID, with: c, top: job.top)
+            pending[localID] = nil
+            if job.top == nil { total += 1 }
+        } catch is DYLoginExpired {
+            pending[localID]?.state = .failed("抖音拦下了这条（需要验证或暂时受限）")
+            sendErr = "抖音拦下了这次评论（需要验证或暂时受限）；评论留在列表里，处理后可点重发"
+            DYRelogin.start { showRelogin = true }
+        } catch let e as DYCommentUnconfirmed {
+            pending[localID]?.state = .unknown(e.message)
+        } catch {
+            pending[localID]?.state = .failed(error.localizedDescription)
+        }
+    }
+
+    private func replaceLocal(_ localID: String, with c: DYComment, top: String?) {
+        if let top, let i = replies[top]?.firstIndex(where: { $0.id == localID }) { replies[top]?[i] = c }
+        else if let i = items.firstIndex(where: { $0.id == localID }) { items[i] = c }
+    }
+
+    private func removeLocal(_ localID: String) {
+        guard let job = pending.removeValue(forKey: localID) else { return }
+        if let top = job.top { replies[top]?.removeAll { $0.id == localID } } else { items.removeAll { $0.id == localID } }
+    }
+
+    /// 失败那条「改一改」：拿回输入框（文字、图片、回复目标都还原），列表里那条撤掉
+    private func editLocal(_ localID: String) {
+        guard let job = pending[localID] else { return }
+        removeLocal(localID)
+        replyTo = job.replyTarget; replyParent = job.replyTarget == nil ? nil : (job.top == job.replyTarget?.id ? nil : job.top)
+        draft = job.text; imageDraft = job.imageDraft; imageUploaded = job.uploaded
+        inputFocused = true
+    }
+
+    @ViewBuilder
     private func row(_ c: DYComment, parent: String?) -> some View {
+        if let job = pending[c.id] {
+            VStack(alignment: .leading, spacing: 6) {
+                rowBody(c).opacity(job.state == .sending ? 0.6 : 1)
+                pendingStatus(c.id, job)
+            }
+            .accessibilityIdentifier("douyin.comment.pending")
+        } else {
+            sentRow(c, parent: parent)
+        }
+    }
+
+    @ViewBuilder
+    private func pendingStatus(_ id: String, _ job: DYPendingSend) -> some View {
+        let danger = theme.status.danger.color(for: scheme)
+        HStack(spacing: 12) {
+            switch job.state {
+            case .sending:
+                ProgressView().controlSize(.mini)
+                Text("发送中…").foregroundStyle(.themeTextSecondary)
+            case .failed(let why):
+                Label("没发出去：\(why)", systemImage: "exclamationmark.circle.fill").foregroundStyle(danger).lineLimit(2)
+                Spacer(minLength: 4)
+                Button("重发") { Task { await deliver(id) } }.disabled(sending).accessibilityIdentifier("douyin.comment.retry")
+                Button("改一改") { editLocal(id) }
+                Button("删除", role: .destructive) { removeLocal(id) }
+            case .unknown(let why):
+                Label(why, systemImage: "questionmark.circle.fill").foregroundStyle(.themeTextSecondary).lineLimit(2)
+                Spacer(minLength: 4)
+                Button("仍要重发") { confirmResend = id }.disabled(sending).accessibilityIdentifier("douyin.comment.retry")
+                Button("删除", role: .destructive) { removeLocal(id) }
+            }
+        }
+        .font(.caption)
+        .buttonStyle(.borderless)
+        .padding(.leading, 42)
+    }
+
+    private func sentRow(_ c: DYComment, parent: String?) -> some View {
         rowBody(c)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -5243,7 +5555,7 @@ struct DYCommentPanel: View {
 
     /// 能删的评论：我自己发的，或者这条作品是我的（作者能删自己作品下的评论）。认不出我是谁时不给删。
     private func canDelete(_ c: DYComment) -> Bool {
-        guard let me = mySec, !me.isEmpty else { return false }
+        guard !DYPendingSend.isLocal(c.id), let me = mySec, !me.isEmpty else { return false }
         return c.sec == me || aweme.author.secUid == me
     }
 
@@ -5293,7 +5605,7 @@ struct DYCommentPanel: View {
                 .font(.caption2).foregroundStyle(.themeTextSecondary)
             }
             Spacer(minLength: 4)
-            commentDigg(c)
+            if !DYPendingSend.isLocal(c.id) { commentDigg(c) }
         }
     }
 
@@ -5390,7 +5702,12 @@ struct DYCommentPanel: View {
             return
         }
         let head = page.first(where: { $0.id == top })
-        DYLiveModel.log("DDFOCUS hit aweme=\(f.awemeID) cid=\(f.cid) parent=\(f.parentCid ?? "-") target=\(target) pinned=\(head?.pinned?.count ?? 0)")
+        DYLiveModel.log("DDFOCUS hit aweme=\(f.awemeID) cid=\(f.cid) parent=\(f.parentCid ?? "-") target=\(target) pinned=\(head?.pinned?.count ?? 0) reply=\(f.startReply ? 1 : 0)")
+        if f.startReply, let c = page.first(where: { $0.id == target }) ?? replies[top]?.first(where: { $0.id == target }) {
+            replyTo = c
+            replyParent = target == top ? nil : top
+            inputFocused = true
+        }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             highlight = target
@@ -5838,5 +6155,27 @@ struct DYCommentTopTracker: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// 签名未完成时的提示：带倒计时，让用户知道大概还要等几秒（老板 2026-11-19）
+struct DYSignWaitHint: View {
+    @ObservedObject var bridge: DouyinBridge
+    let color: Color
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text(Self.text(left: bridge.signSecondsLeft(now: ctx.date)))
+                    .font(.caption2).foregroundStyle(color)
+                    .monospacedDigit()
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    static func text(left: Int?) -> String {
+        if let left { return "等待签名完成才可以发送评论，约 \(left) 秒后再点发送" }
+        return "等待签名完成才可以发送评论，马上就好"
     }
 }

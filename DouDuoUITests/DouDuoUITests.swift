@@ -2,6 +2,68 @@ import XCTest
 
 /// DouDuo 核心流程：推荐流加载 → 视频在走 → 上滑切下一条 → 左滑作者/右滑关注 → 点作者进主页 → 能返回原生页
 final class DouDuoUITests: XCTestCase {
+    func testShortVideoAutoPiPSettingPersists() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment = ["DOUDUO_CHROME_MODE": "rail", "DOUDUO_HASHTAG_FIXTURE": "1"]
+        app.launchArguments = ["-douyin_muted_v1", "YES", "-douyin_autoplay_v1", "NO",
+                               "-duoduomain_tab_v1", "首页", "-douduo_dismissed_update_v1", "9.9.9"]
+        addTeardownBlock { app.terminate() }
+        let form = app.collectionViews.matching(NSPredicate(format: "identifier != %@", "douyin.gallery")).firstMatch
+        func visibleToggle() -> XCUIElement {
+            let toggle = app.switches["settings.autoPip"]
+            if !toggle.exists { form.swipeDown() }
+            for _ in 0..<12 {
+                if toggle.exists, toggle.isHittable,
+                   toggle.frame.minY > form.frame.minY + 100,
+                   toggle.frame.maxY < form.frame.maxY - 60 { return toggle }
+                let upward = !toggle.exists || toggle.frame.minY >= form.frame.minY + 100
+                let start = form.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: upward ? 0.65 : 0.35))
+                let end = form.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: upward ? 0.45 : 0.55))
+                start.press(forDuration: 0.05, thenDragTo: end)
+            }
+            XCTFail("PiP setting did not become fully visible")
+            return toggle
+        }
+        func openSetting() throws -> XCUIElement {
+            let more = app.buttons.matching(identifier: "douyin.more")
+            XCTAssertTrue(more.firstMatch.waitForExistence(timeout: 20))
+            let button = try XCTUnwrap(more.allElementsBoundByIndex.first { !$0.frame.isEmpty })
+            button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            let settings = app.buttons["设置"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            settings.tap()
+            XCTAssertTrue(form.waitForExistence(timeout: 5))
+            return visibleToggle()
+        }
+        func set(_ toggle: XCUIElement, to value: String) {
+            if toggle.value as? String != value {
+                let control = toggle.switches.firstMatch
+                if control.exists { control.tap() }
+                else { toggle.tap() }
+            }
+            // Reacquire after SwiftUI updates the form in response to AppStorage.
+            let updated = visibleToggle()
+            XCTAssertTrue(waitUntil(timeout: 5) { updated.exists && updated.value as? String == value },
+                          "Requested \(value); \(updated.debugDescription)")
+        }
+        app.launch()
+        let toggle = try openSetting()
+        // Establish OFF without depending on a previous simulator session.
+        set(toggle, to: "0")
+        attach(app, "short-video-pip-setting-off")
+        set(toggle, to: "1")
+        attach(app, "short-video-pip-setting-on")
+        app.terminate()
+        app.launch()
+        let persisted = try openSetting()
+        XCTAssertEqual(persisted.value as? String, "1")
+        set(persisted, to: "0")
+        app.terminate()
+        app.launch()
+        XCTAssertEqual(try openSetting().value as? String, "0")
+    }
+
     func testMessageAppearanceLight() throws { try verifyMessageAppearance("light") }
     func testMessageAppearanceDark() throws { try verifyMessageAppearance("dark") }
 
@@ -3623,6 +3685,8 @@ final class DouDuoUITests: XCTestCase {
     /// 在「更多」第一层切换界面模式，立即生效。
     func testStandaloneCommentsRespectLayout() throws {
         continueAfterFailure = false
+        let closeOnly = ProcessInfo.processInfo.environment["DD_CLOSE_ONLY"] == "1"
+        if closeOnly { XCUIDevice.shared.orientation = .landscapeLeft }
         let modes = ProcessInfo.processInfo.environment["DD_ONLY_MODE"].map { [$0] } ?? ["classic", "rail", "minimal", "duoClassic"]
         for mode in modes {
             let app = XCUIApplication()
@@ -3644,18 +3708,68 @@ final class DouDuoUITests: XCTestCase {
             XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "douyin.list.player").firstMatch.waitForExistence(timeout: 30))
             let comment = app.buttons.matching(identifier: "douyin.comments").allElementsBoundByIndex.first { $0.isHittable }
             XCTAssertNotNil(comment)
+            let progress = app.descendants(matching: .any).matching(identifier: "douyin.progress").firstMatch
+            func elapsed() -> Int? {
+                guard progress.exists, let value = progress.value as? String else { return nil }
+                return value.split(separator: " ").first.flatMap { Int($0) }
+            }
+            func scrub(from: CGFloat, to: CGFloat) {
+                progress.coordinate(withNormalizedOffset: CGVector(dx: from, dy: 0.7))
+                    .press(forDuration: 0.1, thenDragTo: progress.coordinate(withNormalizedOffset: CGVector(dx: to, dy: 0.7)))
+            }
+            if closeOnly {
+                XCTAssertTrue(progress.waitForExistence(timeout: 10))
+                XCTAssertTrue(waitUntil(timeout: 15) {
+                    guard let value = progress.value as? String,
+                          let duration = value.split(separator: " ").dropFirst(2).first.flatMap({ Int($0) }) else { return false }
+                    return duration > 8
+                })
+                scrub(from: 0.10, to: 0.35)
+                XCTAssertTrue(waitUntil(timeout: 5) { (elapsed() ?? 0) > 1 })
+            }
+            let before = closeOnly ? elapsed() : nil
             comment?.tap()
             let list = app.scrollViews["douyin.comments.list"].firstMatch
             let related = app.scrollViews["douyin.comments.relatedSearch"].firstMatch
             XCTAssertTrue(list.waitForExistence(timeout: 10))
-            XCTAssertTrue(related.waitForExistence(timeout: 20))
-            // 评论面板四种界面统一经典样式（老板 2026-11-17）：相关搜索在评论列表上方
-            XCTAssertLessThanOrEqual(related.frame.maxY, list.frame.minY + 2, mode + " 相关搜索应在评论上方")
-            if app.windows.firstMatch.frame.width < 700 {
-                XCTAssertEqual(list.frame.maxX, app.windows.firstMatch.frame.maxX, accuracy: 2, mode + " 评论右边不应留空")
+            if !closeOnly {
+                XCTAssertTrue(related.waitForExistence(timeout: 20))
+                // 评论面板四种界面统一经典样式（老板 2026-11-17）：相关搜索在评论列表上方
+                XCTAssertLessThanOrEqual(related.frame.maxY, list.frame.minY + 2, mode + " 相关搜索应在评论上方")
+                if app.windows.firstMatch.frame.width < 700 {
+                    XCTAssertEqual(list.frame.maxX, app.windows.firstMatch.frame.maxX, accuracy: 2, mode + " 评论右边不应留空")
+                }
             }
             attach(app, "v14-standalone-comments-" + mode)
-            app.buttons["douyin.comments.close"].firstMatch.tap()
+            if closeOnly {
+                let window = app.windows.firstMatch.frame
+                XCTAssertGreaterThan(window.width, window.height, "需要横屏")
+                XCTAssertGreaterThanOrEqual(window.width, 700, "需要 Duo 展开内屏")
+            }
+            let close = app.buttons["douyin.comments.close"].firstMatch
+            var splitPosition: Int?
+            if closeOnly {
+                let openingPosition = try XCTUnwrap(before)
+                XCTAssertTrue(waitUntil(timeout: 5) {
+                    guard let position = elapsed() else { return false }
+                    return abs(position - openingPosition) <= 1
+                }, "打开评论应保留原进度")
+                scrub(from: 0.35, to: 0.70)
+                XCTAssertTrue(waitUntil(timeout: 5) { (elapsed() ?? 0) >= openingPosition + 2 })
+                let position = try XCTUnwrap(elapsed())
+                splitPosition = position
+                print("COMMENT_PROGRESS full=\(openingPosition) split=\(position)")
+            }
+            XCTAssertTrue(close.isHittable)
+            close.tap()
+            XCTAssertTrue(list.waitForNonExistence(timeout: 5), mode + " 点击关闭后评论列表应消失")
+            if let splitPosition {
+                XCTAssertTrue(waitUntil(timeout: 5) {
+                    guard let position = elapsed() else { return false }
+                    return abs(position - splitPosition) <= 1
+                }, "关闭评论应保留分屏中的新进度")
+                print("COMMENT_PROGRESS restored=\(elapsed() ?? -1)")
+            }
             XCTAssertTrue(app.buttons["douyin.list.back"].firstMatch.isHittable)
             app.terminate()
         }

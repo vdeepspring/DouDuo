@@ -33,6 +33,17 @@ const fixture = {
       }
     },
     {
+      // 11-19 真机：一级评论的通知 parent_id = 作品 id（不是评论 id）
+      nid_str: 'n-top', type: 31, create_time: 1699999998, aweme_id: 'a-3',
+      comment: { parent_id: 'a-3', comment: { cid: 'c-top', aweme_id: 'a-3', text: '一级评论', user: { nickname: '甲' } },
+                 aweme: { aweme_id: 'a-3' } }
+    },
+    {
+      nid_str: 'n-sub', type: 31, create_time: 1699999997, aweme_id: 'a-4',
+      comment: { parent_id: 'c-parent', comment: { cid: 'c-sub', reply_id: 'c-parent', aweme_id: 'a-4', text: '楼中楼', user: { nickname: '乙' } },
+                 aweme: { aweme_id: 'a-4' } }
+    },
+    {
       nid_str: 'n-plain', type: 31, create_time: 1699999999,
       comment: {
         comment: { text: '纯文字评论', user: { nickname: '路人', avatar_thumb: { url_list: ['https://example.invalid/av2'] } } },
@@ -54,8 +65,14 @@ function test(name, fn) { return Promise.resolve().then(fn).then(() => { count++
 (async () => {
   await test('带图评论通知解出缩略图地址（medium 优先、缺 medium 用 thumb）', async () => {
     const r = JSON.parse(await run());
-    assert.equal(r.items.length, 2);
+    assert.equal(r.items.length, 4);
     assert.deepEqual(r.items[0].images, ['https://example.invalid/m1', 'https://example.invalid/t2']);
+  });
+  await test('一级评论通知：parent_id 是作品 id 时不当楼中楼（否则回复挂到作品 id 下，发了看不到）', async () => {
+    const r = JSON.parse(await run());
+    const top = r.items.find(x => x.cid === 'c-top'), sub = r.items.find(x => x.cid === 'c-sub');
+    assert.equal(top.parentCid, null); assert.equal(top.action, '评论了你');
+    assert.equal(sub.parentCid, 'c-parent'); assert.equal(sub.action, '回复了你的评论');
   });
   await test('无图评论通知 images 为空不报错', async () => {
     const r = JSON.parse(await run());

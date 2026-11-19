@@ -1254,6 +1254,7 @@ struct DYLiveFeed: View {
         .onChange(of: moduleRequest) { _, request in
             guard let request, request.token != appliedModuleToken else { return }
             appliedModuleToken = request.token
+            DYLiveModel.log("DDLIVEMODULE apply \(request.action) token=\(request.token)")
             switch request.action {
             case .followedLive:
                 withAnimation(.easeInOut(duration: 0.2)) {

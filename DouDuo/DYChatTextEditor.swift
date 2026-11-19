@@ -15,14 +15,15 @@ struct DYChatTextEditor: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let view = UITextView()
         view.backgroundColor = .clear
-        view.textColor = .white
+        // 跟随浅/深色：浅色主题黑字、深色主题白字（以前写死 .white，浅色下打字看不见）
+        view.textColor = .label
         view.tintColor = UIColor(red: 1, green: 0.17, blue: 0.33, alpha: 1)
         view.font = .preferredFont(forTextStyle: .body)
         view.adjustsFontForContentSizeCategory = true
         view.textContainerInset = .zero
         view.textContainer.lineFragmentPadding = 0
         view.isScrollEnabled = false
-        view.keyboardAppearance = .dark
+        view.keyboardAppearance = .default
         view.inputAccessoryView = nil
         view.inputAssistantItem.leadingBarButtonGroups = []
         view.inputAssistantItem.trailingBarButtonGroups = []

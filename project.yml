@@ -9,8 +9,8 @@ packages:
     path: Vendor/VLCKit
 settings:
   base:
-    MARKETING_VERSION: 1.6.1
-    CURRENT_PROJECT_VERSION: "117"
+    MARKETING_VERSION: 1.6.3
+    CURRENT_PROJECT_VERSION: "119"
     SWIFT_VERSION: "5.0"
     DEVELOPMENT_TEAM: ""
 targets:
@@ -64,8 +64,10 @@ targets:
     type: bundle.unit-test
     platform: iOS
     sources:
+      - path: DouDuo/DYAutoPiP.swift
       - path: DouDuo/DYVideoFit.swift
       - path: DouDuo/DYShareLinkParse.swift
+      - path: DouDuo/DYKeyStateProbe.swift
       - path: DouDuoTests
     settings:
       base:

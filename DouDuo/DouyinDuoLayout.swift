@@ -434,7 +434,7 @@ struct DYPanelDismissGesture: ViewModifier {
                     (dy > 70 || (dy > 20 && value.predictedEndTranslation.height > 150))
                 if right || down { onClose() }
                 else { sheetDrag?.finish(false) }
-            })
+            }, including: onClose == nil ? .none : .all)
     }
 }
 
@@ -812,6 +812,7 @@ struct DYCommentPlayerLayout<Video: View>: View {
                     .environment(\.duoCleanScreen, cleanScreen)
                     .environment(\.dyCommentsOpen, showsComments || layout.showsPane)
                     .frame(width: layout.videoSize.width, height: layout.videoSize.height)
+                    .environment(\.dyRestrictsPlaybackToPane, layout.showsPane && layout.sideBySide)
                     // 侧栏评论时裁边：播放器环境光底铺满整屏，会盖住右侧评论栏（同推荐页 DYCommentStage）
                     .modifier(DDClipIf(on: layout.showsPane && layout.sideBySide))
                 if layout.showsPane, let aweme = commentItem {
@@ -823,7 +824,7 @@ struct DYCommentPlayerLayout<Video: View>: View {
                         .id(aweme.id)
                         .frame(width: layout.paneSize.width, height: layout.paneSize.height)
                         .clipped()
-                        .dyDeskLight(layout.resident && !layout.sideBySide)
+                        .dyDeskLight(layout.resident && !layout.sideBySide, videoHeight: layout.videoSize.height)
                         .overlay(alignment: .leading) {
                             if layout.sideBySide { Color(uiColor: .separator).frame(width: 0.5) }
                         }
@@ -839,6 +840,8 @@ struct DYCommentPlayerLayout<Video: View>: View {
                                          isClean: cleanScreen, onToggleClean: { cleanScreen.toggle() },
                                          onBack: onBack, backIdentifier: backIdentifier)
                         .id(horizontalCommentStatus || hidesCommentStatus)
+                        .frame(width: layout.videoSize.width)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .modifier(DYStandaloneBarPolicy(classic: usesClassicLayout))

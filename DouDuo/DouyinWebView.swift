@@ -158,6 +158,9 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
     weak var web: WKWebView?
     /// 网页 postMessage("ddMsg") 转给 App（如聊天页点分享视频 → 跳原生播放）
     var onAppMessage: ((String) -> Void)?
+    /// 聊天页里点头像/昵称，抖音网页会整页跳 `/user/<sec_uid>`（网页版主页）。
+    /// 设了这个回调就把这类跳转拦下，交给 App 打开原生作者主页（只有私信网页设它）。
+    var onUserLink: ((String) -> Void)?
     private var clickedLogin = false
     private var filledPhone = false
     private var filledCode = false
@@ -183,10 +186,26 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
             .contains { h == $0 || h.hasSuffix("." + $0) }
     }
 
+    /// `https://www.douyin.com/user/<sec_uid>?…` → sec_uid；`/user/self`（我自己）和非用户页返回 nil
+    static func userSecUid(from url: URL) -> String? {
+        guard isDouyinHost(url.host) else { return nil }
+        let parts = url.path.split(separator: "/")
+        guard parts.count >= 2, parts[0] == "user" else { return nil }
+        let sec = String(parts[1])
+        guard sec != "self", sec.count >= 20 else { return nil }
+        return sec
+    }
+
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         guard let url = action.request.url, let scheme = url.scheme?.lowercased() else {
             decisionHandler(.cancel); return
+        }
+        if let onUserLink, action.targetFrame?.isMainFrame != false, let sec = Self.userSecUid(from: url) {
+            decisionHandler(.cancel)
+            DYLiveModel.log("DDMSGUSER intercept nav sec=\(sec.prefix(12))")
+            onUserLink(sec)
+            return
         }
         // snssdk1128:// / itms-apps:// / aweme:// 等一律拦掉，不唤起 App 也不去 App Store
         guard ["http", "https", "about", "blob", "data"].contains(scheme) else {
@@ -291,6 +310,11 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            if let onUserLink, let sec = Self.userSecUid(from: url) {
+                DYLiveModel.log("DDMSGUSER intercept open sec=\(sec.prefix(12))")
+                onUserLink(sec)
+                return nil
+            }
             webView.load(URLRequest(url: url))
         }
         return nil
@@ -307,6 +331,52 @@ final class DDAppMessageHandler: NSObject, WKScriptMessageHandler {
         model.onAppMessage?(body)
     }
 }
+
+/// 私信网页里点头像/昵称：抖音网页会跳 `/user/<sec_uid>`（a 链接 / SPA 路由 / window.open 三条路都拦），
+/// 改发 ddMsg {type:"user"} 给 App 开原生作者主页。导航层还有 DouyinWebModel.onUserLink 兜底。
+private let ddUserLinkHookJS = #"""
+(() => {
+  if (window.__ddUserLinkHook) return; window.__ddUserLinkHook = 1;
+  const post = (o) => { try { window.webkit.messageHandlers.ddMsg.postMessage(JSON.stringify(o)); } catch (e) {} };
+  const userSec = (href) => {
+    try {
+      const u = new URL(href, location.href);
+      if (!/(^|\.)douyin\.com$/.test(u.hostname)) return null;
+      const m = u.pathname.match(/^\/user\/([^/?#]+)/);
+      return m && m[1] !== 'self' && m[1].length >= 20 ? m[1] : null;
+    } catch (e) { return null; }
+  };
+  const inChat = () => /\/chat/.test(location.pathname);
+  document.addEventListener('click', ev => {
+    try {
+      if (!inChat()) return;
+      const a = ev.target && ev.target.closest && ev.target.closest('a[href]');
+      const sec = a && userSec(a.getAttribute('href'));
+      if (!sec) return;
+      ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation();
+      post({type: 'user', sec});
+    } catch (e) {}
+  }, true);
+  for (const k of ['pushState', 'replaceState']) {
+    const orig = history[k];
+    history[k] = function(state, title, url) {
+      try {
+        const sec = url != null && inChat() ? userSec(String(url)) : null;
+        if (sec) { post({type: 'user', sec}); return; }
+      } catch (e) {}
+      return orig.apply(this, arguments);
+    };
+  }
+  const origOpen = window.open;
+  window.open = function(url) {
+    try {
+      const sec = url != null && inChat() ? userSec(String(url)) : null;
+      if (sec) { post({type: 'user', sec}); return null; }
+    } catch (e) {}
+    return origOpen.apply(this, arguments);
+  };
+})();
+"""#
 
 /// 聊天页点「分享视频」卡片 → 拦下点击、抽出 aweme_id 发给 App 跳原生播放（只在 /chat 页生效，别处不动）
 /// 卡片通常是缩略图不是 <video>：从点击处向上找含媒体特征的消息卡，再从 React props 抽 aweme_id；
@@ -342,12 +412,13 @@ private let ddVideoTapHookJS = #"""
         const payload = message.parsedContent || JSON.parse(message.content || 'null');
         // 三种分享卡的 ID 字段不一样（真机抓包）：
         //   aweType 800（视频）/ 0（图文）：itemId
-        //   aweType 11054（群里的视频卡 BulletBulletVideo）：item_id 或 aweme_info.aweme_id
+        //   aweType 11054 / 11055（群里、私聊里的视频卡 BulletBulletVideo）：item_id 或 aweme_info.aweme_id
         const pick = v => (typeof v === 'number' && Number.isSafeInteger(v)) ? null : (typeof v === 'string' ? v : null);
         const id = pick(payload?.itemId) || pick(payload?.item_id)
           || pick(payload?.aweme_info?.aweme_id) || pick(payload?.aweme_info?.item_id);
         if (typeof id !== 'string' || !/^\d{15,25}$/.test(id)) return null;
-        if (Number(payload?.aweType) === 11054 && (payload?.item_id || payload?.aweme_info)) return id;
+        // 11055：私聊里的同款视频卡（11-18 真机：keys=aweme_info,cover_url,item_id…），以前没认出来就交给网页自己播
+        if ([11054, 11055].includes(Number(payload?.aweType)) && (payload?.item_id || payload?.aweme_info)) return id;
         // 800 = 分享视频；图文（笔记）分享的 aweType 是 0，payload 里带 image_count / is_slides /
         // awemeType=68。只认「确实是作品卡」的 payload，避免把普通消息里的 id 当作品 id。
         const awe = Number(payload?.aweType);
@@ -465,6 +536,7 @@ struct DouyinWebContainer: UIViewRepresentable {
         let cfg = WKWebViewConfiguration()
         DDWebAppearance.install(in: cfg)
         cfg.websiteDataStore = .default()            // 登录态持久化
+        DYKeyStateProbe.install(in: cfg, tag: isChat ? "chat" : "web")
         #if DEBUG
         if DYMessageFixture.enabled && isChat { cfg.websiteDataStore = .nonPersistent() }
         #endif
@@ -491,12 +563,19 @@ struct DouyinWebContainer: UIViewRepresentable {
             WKUserScript(source: ddVideoTapHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         // 信息里的图片本地缓存：ddimg:// 由 App 供图，键只认路径（签名变化也能命中）
         if isChat {
+            // 实证：后台私信页开页 2 秒内自己发了 passport/web/logout（11-18 19:04:39），App 原生没有调用登出
+            DYLogoutBlock.install(in: cfg)
             cfg.setURLSchemeHandler(DYChatImageSchemeHandler(), forURLScheme: DYChatImageCache.scheme)
             cfg.userContentController.addUserScript(
                 WKUserScript(source: DYChatImageRewrite.script, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
             // 长按消息气泡 → 通知 App 弹「删除这条消息」
             cfg.userContentController.addUserScript(
                 WKUserScript(source: DYChatMessageMenu.script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            // 仅 DEBUG：只读记录私信网页的数据来源与消息状态字段（DDIMPROBE），不改网页行为
+            DYIMProbe.install(in: cfg)
+            // 点头像/昵称交给 App 开原生作者主页（只装在私信网页；网页版照常跳网页主页）
+            cfg.userContentController.addUserScript(
+                WKUserScript(source: ddUserLinkHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         }
         // 网页 → App 消息通道
         cfg.userContentController.add(DDAppMessageHandler(model), name: "ddMsg")

@@ -673,10 +673,18 @@ struct DYMessagesScreen: View {
         .task {
             // 网页聊天页 → App：点分享视频卡片跳原生播放（DouyinWebView 的 ddMsg 通道）
             if #available(iOS 27.1, *) { DYLiveModel.log("DDMSG layout=resizable") } else { DYLiveModel.log("DDMSG layout=legacy") }
+            // 聊天里点对方头像/昵称：网页会整页跳 /user/<sec>（网页版主页）→ 拦下改开原生作者主页
+            chatModel.onUserLink = { sec in
+                Task { @MainActor in self.openUser(sec: sec) }
+            }
             chatModel.onAppMessage = { json in
                 guard let data = json.data(using: .utf8),
                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
                 switch obj["type"] as? String {
+                case "user":
+                    guard let sec = obj["sec"] as? String, !sec.isEmpty else { return }
+                    DYLiveModel.log("DDMSGUSER intercept click sec=\(sec.prefix(12))")
+                    Task { @MainActor in self.openUser(sec: sec) }
                 case "msg-menu":
                     guard let token = obj["token"] as? String, !token.isEmpty else { return }
                     Task { @MainActor in self.deletingMessageToken = token }
@@ -741,6 +749,8 @@ struct DYMessagesScreen: View {
         .onAppear { chatSurfaceActive = true }
         .onDisappear {
             chatSurfaceActive = false
+            // 聊天网页关掉后还常驻（下次秒开）：里面正在放的视频/语音必须停，否则退出信息页还在出声
+            DYChatMedia.silence(chatModel.web, reason: "messages-close")
             DYMessageCache.shared.retainChat()
         }
     }
@@ -1320,6 +1330,7 @@ struct DYMessagesScreen: View {
         let wasStranger = cache.selectedChat?.stranger == true
         cache.selectedChat = nil
         chatModel.web?.endEditing(true)
+        DYChatMedia.silence(chatModel.web, reason: "chat-back")
         Task {
             if let web = chatModel.web {
                 // 网页切回列表之前，把刚看的聊天画面（含最新消息）截下来，下次进这条会话直接铺
@@ -1789,6 +1800,15 @@ struct DYMessagesScreen: View {
         guard !f.secUid.isEmpty else { return }
         chatAuthor = .init(name: f.name, avatar: f.avatar, secUid: f.secUid)
     }
+
+    /// 聊天网页里点了某人的头像/昵称（sec_uid）：用已知的会话/朋友资料补名字和头像，打开原生作者主页
+    private func openUser(sec: String) {
+        guard !sec.isEmpty, chatAuthor?.secUid != sec else { return }
+        let row = (conversations + cache.strangerRows + cache.unfollowedRows).first { $0.sec == sec }
+        let friend = friends.first { $0.secUid == sec }
+        chatAuthor = .init(name: row?.name ?? friend?.name ?? "", avatar: row?.avatar ?? friend?.avatar, secUid: sec)
+        DYLiveModel.log("DDMSGUSER open native author sec=\(sec.prefix(12)) known=\(row != nil || friend != nil)")
+    }
 }
 
 // MARK: - 二级页（互动 / 粉丝 / 系统）
@@ -1852,7 +1872,7 @@ struct DYNoticeListScreen: View {
         .overlay { if opening { ProgressView().tint(.primary) } }
         .background(Color.ddBackground.ignoresSafeArea())
         .dyReloginSheet(isPresented: $showRelogin, bridge: bridge) { ok in
-            replyErr = ok ? "已重新登录，再点一次发送" : "还没登录，登录后才能回复"
+            replyErr = ok ? "已核验账号资料；评论权限未确认，草稿已保留，请勿连续重发" : "未完成账号核验；原登录和草稿未自动清理"
         }
 
         .foregroundStyle(Color.primary)
@@ -1885,7 +1905,7 @@ struct DYNoticeListScreen: View {
         }
         .fullScreenCover(item: $player) { p in
             DYListPlayer(bridge: bridge, title: p.item.desc.isEmpty ? "视频" : p.item.desc, items: [p.item], start: 0,
-                         onAuthor: { author = $0.author }, commentFocus: p.focus)
+                         onAuthor: { author = $0.author }, commentFocus: p.focus, hardStopOnDismiss: true)
         }
         .safeAreaInset(edge: .bottom) { if replying != nil { replyBar.padding(.bottom, replyKeyboardInset) } }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
@@ -1976,7 +1996,16 @@ struct DYNoticeListScreen: View {
                         .accessibilityIdentifier("douyin.notice.reply.cancel")
                 }
             }
-            if let e = replyErr { Text(e).font(.caption2).foregroundStyle(.red) }
+            if replyErr == DYCommentPanel.waitSignText {
+                DYSignWaitHint(bridge: bridge, color: .red).accessibilityIdentifier("douyin.notice.reply.err")
+                    .onReceive(bridge.$signReady) { ok in
+                        guard ok else { return }
+                        replyErr = DYCommentPanel.signDoneText
+                        Task { @MainActor in try? await Task.sleep(for: .seconds(3)); if replyErr == DYCommentPanel.signDoneText { replyErr = nil } }
+                    }
+            } else if let e = replyErr {
+                Text(e).font(.caption2).foregroundStyle(e == DYCommentPanel.signDoneText ? .green : .red).accessibilityIdentifier("douyin.notice.reply.err")
+            }
             HStack(spacing: 8) {
                 TextField("回复评论…", text: $replyDraft, axis: .vertical)
                     .lineLimit(1...4)
@@ -2008,6 +2037,13 @@ struct DYNoticeListScreen: View {
     }
 
     private func startReply(_ n: DYNotice) {
+        // 老板 11-19：通知里直接回复屡次「显示成功却看不到」，评论区里回复一直正常。
+        // 有视频和评论 id 的，一律打开那条视频的评论区并进入「回复 @它」，用评论区同一套发送。
+        if n.commentFocus != nil {
+            DYLiveModel.log("DDNOTICEREPLY via=comment-panel")
+            Task { await open(n, reply: true) }
+            return
+        }
         if replying?.id != n.id { replyDraft = "" }
         replying = n; replyErr = nil
         replyFocused = true
@@ -2021,20 +2057,40 @@ struct DYNoticeListScreen: View {
         guard let n = replying, let aweme = n.awemeID, let cid = n.cid else { return }
         let text = replyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !replySending else { return }
+        guard bridge.signReady else {
+            replyErr = DYCommentPanel.waitSignText
+            DYLiveModel.log("DDSIGN reply-blocked waiting")
+            Task { await bridge.prepareSigning() }
+            return
+        }
         replySending = true
         defer { replySending = false }
         do {
             // 一级评论：reply_id = 它；楼中楼：reply_id = 一级评论、reply_to_reply_id = 这条（网页同款）
-            _ = try await bridge.publishComment(aweme, text: text, replyID: n.parentCid ?? cid,
-                                                replyToReplyID: n.parentCid == nil ? nil : cid)
+            let thread = n.threadParent ?? cid
+            let sent = try await bridge.publishComment(aweme, text: text, replyID: thread,
+                                                       replyToReplyID: n.threadParent == nil ? nil : cid)
             replied.insert(n.id)
             closeReply()
-            showToast("已回复")
+            showToast("已发出，正在核对评论区…")
+            // 抖音回了成功也可能看不到（挂错楼 / 被折叠）：回头真去那条评论的回复里找，找不到就照实说
+            let visible = await bridge.replyIsVisible(aweme, thread: thread, id: sent.id)
+            DYLiveModel.log("DDNOTICEREPLY visible=\(visible.map { $0 ? "yes" : "no" } ?? "unknown") thread=\(thread) id=\(sent.id)")
+            switch visible {
+            case true?: showToast("已回复，评论区可见")
+            case false?:
+                replied.remove(n.id)
+                replyErr = "抖音收下了，但这条回复在评论区里找不到（可能被折叠或仅自己可见）。可以点视频进评论区核对。"
+                replying = n
+            case nil: showToast("已发出，评论区暂时核对不了")
+            }
         } catch is DYLoginExpired {
             // 回复框和草稿留着：重新登录后再点一次发送
-            replyErr = "登录已失效（能浏览但发不了评论），正在打开登录…"
+            replyErr = "抖音拦下了这次回复（需要验证或暂时受限）；登录和草稿已保留，请选择恢复方式"
             replyFocused = false
             DYRelogin.start { showRelogin = true }
+        } catch let e as DYCommentUnconfirmed {
+            replyErr = e.message + "，草稿已保留，勿连续重发"
         } catch {
             replyErr = "发送失败：\(error.localizedDescription)"
         }
@@ -2248,7 +2304,7 @@ struct DYNoticeListScreen: View {
         }
     }
 
-    private func open(_ n: DYNotice) async {
+    private func open(_ n: DYNotice, reply: Bool = false) async {
         guard isActive else { return }
         let generation = activationGeneration
         if n.type == 33, let a = n.author {
@@ -2266,7 +2322,9 @@ struct DYNoticeListScreen: View {
             let item = try await bridge.awemeDetail(id)
             guard generation == activationGeneration else { return }
             // 评论通知：进视频直接打开评论区并定位到这条评论
-            player = DYMessagePlay(item: item, focus: n.commentFocus)
+            var focus = n.commentFocus
+            focus?.startReply = reply
+            player = DYMessagePlay(item: item, focus: focus)
         } catch {
             self.error = error.localizedDescription
         }
@@ -3580,6 +3638,8 @@ private struct DYForwardWebContainer: UIViewRepresentable {
           document.addEventListener('DOMContentLoaded', fix); fix();
         })()
         """#, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        DYLogoutBlock.install(in: config)
+        DYKeyStateProbe.install(in: config, tag: "forward")
         let web = WKWebView(frame: .zero, configuration: config)
         web.customUserAgent = DouyinWeb.userAgent
         web.navigationDelegate = model; web.uiDelegate = model; model.web = web
@@ -3665,5 +3725,17 @@ struct DYForwardMenu: View {
         let b = builtAt > 0 ? Int((builtAt - tapAt) * 1000) : -1
         DYLiveModel.log("DDMSGOPEN tap→built=\(b)ms tap→appear=\(Int((CACurrentMediaTime() - tapAt) * 1000))ms")
         tapAt = 0
+    }
+}
+
+
+/// 常驻聊天网页里的视频、语音：离开会话或关掉信息页时一律停掉（网页自己放的视频不归原生播放器管）。
+@MainActor enum DYChatMedia {
+    static let pauseJS = "document.querySelectorAll('video,audio').forEach(m=>{try{m.pause()}catch(e){}});true"
+    static func silence(_ web: WKWebView?, reason: String) {
+        guard let web else { return }
+        web.pauseAllMediaPlayback { }
+        web.evaluateJavaScript(pauseJS) { _, _ in }
+        DYLiveModel.log("DDCHATMEDIA pause reason=\(reason)")
     }
 }

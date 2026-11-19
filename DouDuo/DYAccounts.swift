@@ -139,6 +139,9 @@ final class DYAccountStore: ObservableObject {
 
     /// 删掉抖音相关 cookie（登录态）。localStorage 等网站数据也一起清，免得上一个账号的页面状态串过来
     static func clearDouyinSession() async {
+        // App 自己清的（退出 / 切换）：登录守护不弹「登录已失效」；cookie 变化通知是异步到的，多留 2 秒
+        DYSessionWatch.shared.suppressed += 1
+        defer { Task { @MainActor in try? await Task.sleep(for: .seconds(2)); DYSessionWatch.shared.suppressed -= 1 } }
         let store = WKWebsiteDataStore.default()
         for c in await store.httpCookieStore.allCookies() where isDouyin(c.domain) {
             await store.httpCookieStore.deleteCookie(c)

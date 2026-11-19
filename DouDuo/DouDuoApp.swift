@@ -101,6 +101,16 @@ struct DouDuoApp: App {
                                    diskPath: "dd-url-cache")
         // 自动清理以前版本漏在 tmp 里的视频下载残留（分段目录 / 半截下载），老用户升级后不用手动点清理
         DYStorageFiles.cleanLeftoversAtLaunch()
+        // 后台网页不许登出 + 登录被清掉时提示（老板 11-18：评论发不出就是被退出了，App 还没提示）
+        Task { @MainActor in
+            DYLogoutBlock.prepare()
+            DYKeyStateProbe.log = { DYLiveModel.log($0) }
+            DYPassportVerify.log = { DYLiveModel.log($0) }
+            #if DEBUG
+            DYPassportVerify.runDemoIfRequested()
+            #endif
+            DYSessionWatch.shared.start()
+        }
     }
 
     var body: some Scene {

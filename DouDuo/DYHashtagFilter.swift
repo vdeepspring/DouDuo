@@ -49,6 +49,9 @@ enum DYContentPrefs {
     static let portraitOnlyKey = "douyin_portrait_only_v3"
     /// 只看短视频的时长上限（秒），0 = 不限
     static let shortMaxKey = "douyin_short_max_v1"
+    /// 实验：推荐请求里 aweme_pc_rec_raw_data.is_client 改成 true（自称抖音电脑客户端），默认关
+    static let feedIsClientKey = "douyin_feed_is_client_v1"
+    static var feedIsClient: Bool { UserDefaults.standard.bool(forKey: feedIsClientKey) }
     static let shortChoices: [(Int, String)] = [(0, "不限"), (60, "1 分钟内"), (180, "3 分钟内"), (300, "5 分钟内")]
 
     /// 图集不算时长，一律放行；拿不到时长（0）的视频在限定时不放，免得混进长视频

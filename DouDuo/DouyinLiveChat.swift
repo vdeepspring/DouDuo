@@ -29,6 +29,8 @@ final class DYLiveChat: NSObject, ObservableObject, WKNavigationDelegate {
         cfg.allowsInlineMediaPlayback = true
         // 直播间页面会自己拉流播放：一律掐掉，只要聊天区
         cfg.userContentController.addUserScript(WKUserScript(source: Self.noMediaJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        DYKeyStateProbe.install(in: cfg, tag: "livechat")
+        DYLogoutBlock.install(in: cfg)
         web = WKWebView(frame: CGRect(x: 0, y: 0, width: 1280, height: 800), configuration: cfg)
         web.customUserAgent = DouyinWeb.userAgent
         super.init()

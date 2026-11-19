@@ -2,9 +2,8 @@ import AVKit
 import Combine
 import UIKit
 
-/// One controller for the current inline AVPlayer layer. Clean-screen mode
-/// opts into the system's automatic PiP transition; ordinary playback keeps
-/// the app's existing pause-on-exit policy.
+/// One controller for the current inline AVPlayer layer. Clean-screen mode or
+/// the short-video preference opts into the system's automatic PiP transition.
 @MainActor
 final class DYPictureInPicture: NSObject, ObservableObject, @MainActor AVPictureInPictureControllerDelegate {
     @Published private(set) var active = false
@@ -58,6 +57,10 @@ final class DYPictureInPicture: NSObject, ObservableObject, @MainActor AVPicture
             fallbackTask?.cancel()
             if active || starting { controller?.stopPictureInPicture() }
         }
+        // Disabling automatic start alone can leave an idle controller eligible.
+        if !DYAutoPiP.keepsPiPController(enabled: enabled, active: active, starting: starting) {
+            releaseController()
+        }
     }
 
     func didEnterBackground() {
@@ -84,14 +87,9 @@ final class DYPictureInPicture: NSObject, ObservableObject, @MainActor AVPicture
 
     func invalidate() {
         fallbackTask?.cancel()
-        possibleObservation?.invalidate()
-        possibleObservation = nil
-        generation = UUID()
-        if canStart { canStart = false }
-        controller?.canStartPictureInPictureAutomaticallyFromInline = false
-        controller?.delegate = nil
-        if controller?.isPictureInPictureActive == true { controller?.stopPictureInPicture() }
-        controller = nil
+        let previous = controller
+        releaseController()
+        if previous?.isPictureInPictureActive == true { previous?.stopPictureInPicture() }
         layer = nil
         enabled = false
         starting = false
@@ -99,15 +97,28 @@ final class DYPictureInPicture: NSObject, ObservableObject, @MainActor AVPicture
         if active { active = false }
     }
 
+    private func releaseController() {
+        possibleObservation?.invalidate()
+        possibleObservation = nil
+        generation = UUID()
+        if canStart { canStart = false }
+        controller?.canStartPictureInPictureAutomaticallyFromInline = false
+        controller?.delegate = nil
+        controller = nil
+    }
+
     func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard self.controller === controller else { return }
         starting = true
         restoring = false
     }
 
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard self.controller === controller else { return }
         starting = false
         active = true
         fallbackTask?.cancel()
+        if !enabled { controller.stopPictureInPicture() }
         #if DEBUG
         ddWrite("DDPIP started")
         #endif
@@ -115,15 +126,18 @@ final class DYPictureInPicture: NSObject, ObservableObject, @MainActor AVPicture
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     failedToStartPictureInPictureWithError error: Error) {
+        guard self.controller === controller else { return }
         starting = false
         active = false
         #if DEBUG
         ddWrite("DDPIP failed \(error.localizedDescription)")
         #endif
         if UIApplication.shared.applicationState == .background { onUnavailable?() }
+        if !enabled { releaseController() }
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard self.controller === controller else { return }
         starting = false
         active = false
         #if DEBUG
@@ -131,10 +145,14 @@ final class DYPictureInPicture: NSObject, ObservableObject, @MainActor AVPicture
         #endif
         if !restoring, UIApplication.shared.applicationState == .background { onBackgroundClose?() }
         restoring = false
+        if !DYAutoPiP.keepsPiPController(enabled: enabled, active: active, starting: starting) {
+            releaseController()
+        }
     }
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+        guard self.controller === controller else { completionHandler(false); return }
         restoring = true
         // The same video page remains mounted in the same NavigationStack.
         completionHandler(true)

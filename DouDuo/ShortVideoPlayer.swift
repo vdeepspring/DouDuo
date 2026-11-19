@@ -23,13 +23,32 @@ final class DDPlayback {
     private var stoppers: [UUID: () -> Void] = [:]
     private var starters: [UUID: () -> Void] = [:]
     private var sessionRetainers: [UUID: () -> Bool] = [:]
+    /// 播放器所在的遮罩层级：0 = 首页；从信息页/我的里点开的全屏播放器 = 打开时的遮罩数。
+    /// 遮罩数没超过这一层，说明它就是最上面那层，可以播（老板 11-18：信息里点开的视频要等十几秒才动）。
+    private var coverLevels: [UUID: Int] = [:]
     private var lock = NSLock()
     /// App 当前是否在前台：注册晚于切后台时（视频刚起播），要立刻停，不能接着响
     private(set) var appIsActive = true
     private(set) var pauseReason: DDPlaybackPauseReason = .background
     /// 转发等覆盖层还盖着。后台锁不能把它清掉，前台回调也不能在它消失前把直播拉起来。
     private var coverCount = 0
-    var coverHold: Bool { coverCount > 0 }
+    // Settings may destroy their presenter when switching UI mode.
+    // Stable owners make root teardown and late sheet dismissal idempotent.
+    private var settingsCovers: Set<UUID> = []
+    var coverHold: Bool { coverDepth > 0 }
+    var coverDepth: Int { coverCount + settingsCovers.count }
+    /// 这一层的播放器现在是不是露在最上面
+    func isUncovered(level: Int) -> Bool { coverDepth == 0 || (level > 0 && coverDepth <= level) }
+
+    func beginSettingsCover(_ owner: UUID) {
+        guard settingsCovers.insert(owner).inserted else { return }
+        pauseAll(reason: .cover, countLegacyCover: false)
+    }
+
+    func endSettingsCover(_ owner: UUID) {
+        guard settingsCovers.remove(owner) != nil else { return }
+        resumeAfterLastCover()
+    }
     @MainActor private var offlineLibraryPresentations: Set<UUID> = []
     @MainActor var offlineLibraryPresented: Bool { !offlineLibraryPresentations.isEmpty }
 
@@ -61,12 +80,16 @@ final class DDPlayback {
     static var bgPlay: Bool { UserDefaults.standard.bool(forKey: "douyin_bg_play_v1") }
 
     func register(_ id: UUID, stop: @escaping () -> Void, start: @escaping () -> Void,
-                  retainsAudioSession: (() -> Bool)? = nil, playsInsideCover: Bool = false) {
+                  retainsAudioSession: (() -> Bool)? = nil, playsInsideCover: Bool = false, coverLevel: Int = 0) {
         lock.lock(); defer { lock.unlock() }
         stoppers[id] = stop; starters[id] = start
+        coverLevels[id] = coverLevel
         if let retainsAudioSession { sessionRetainers[id] = retainsAudioSession }
         else { sessionRetainers[id] = nil }
-        let shouldStop = !appIsActive && !playsInsideCover
+        // 被遮罩挡住才停；自己就在最上层（信息页里点开的视频）时不停
+        let onTop = coverLevel > 0 && coverDepth > 0 && coverDepth <= coverLevel
+            && UIApplication.shared.applicationState == .active
+        let shouldStop = !appIsActive && !playsInsideCover && !onTop
         #if DEBUG
         ddWrite("DDBG register \(id.uuidString.prefix(4)) total=\(stoppers.count) appActive=\(appIsActive)")
         #endif
@@ -74,7 +97,7 @@ final class DDPlayback {
     }
     func unregister(_ id: UUID) {
         lock.lock(); defer { lock.unlock() }
-        stoppers[id] = nil; starters[id] = nil; sessionRetainers[id] = nil
+        stoppers[id] = nil; starters[id] = nil; sessionRetainers[id] = nil; coverLevels[id] = nil
         #if DEBUG
         ddWrite("DDBG unregister \(id.uuidString.prefix(4)) total=\(stoppers.count)")
         #endif
@@ -91,11 +114,16 @@ final class DDPlayback {
         if pauseReason == .inactive { pauseReason = previous }
     }
     func pauseAll(reason: DDPlaybackPauseReason = .background) {
-        if reason == .cover { coverCount += 1 }
-        let backgroundWhileCover = reason == .background && !appIsActive && coverCount > 0
+        pauseAll(reason: reason, countLegacyCover: true)
+    }
+
+    private func pauseAll(reason: DDPlaybackPauseReason, countLegacyCover: Bool) {
+        let addsLegacyCover = reason == .cover && countLegacyCover
+        if addsLegacyCover { coverCount += 1 }
+        let backgroundWhileCover = reason == .background && !appIsActive && coverHold
         if !backgroundWhileCover {
             guard DYLivePlaybackGate.apply(appIsActive: appIsActive, command: .pause) else {
-                if reason == .cover { coverCount = max(0, coverCount - 1) }
+                if addsLegacyCover { coverCount = max(0, coverCount - 1) }
                 return
             }
             appIsActive = false
@@ -125,16 +153,30 @@ final class DDPlayback {
     func resumeAll() {
         guard DYLivePlaybackGate.apply(appIsActive: appIsActive, command: .resume) else { return }
         appIsActive = true
-        guard coverCount == 0 else { return }
+        guard !coverHold else { startPlayersOnTop(); return }
         startRegisteredPlayers()
     }
     /// 覆盖层消失。还在后台时只减计数；人已经回到前台才启动。
     func releaseCover() {
         guard coverCount > 0 else { return }
         coverCount -= 1
-        guard coverCount == 0, UIApplication.shared.applicationState == .active else { return }
+        resumeAfterLastCover()
+    }
+    private func resumeAfterLastCover() {
+        guard UIApplication.shared.applicationState == .active else { return }
+        guard !coverHold else { startPlayersOnTop(); return }
         appIsActive = true
         startRegisteredPlayers()
+    }
+    /// 还有遮罩时：只启动「就在最上层」的播放器（例如信息页里点开的视频关掉它自己的设置页后）
+    private func startPlayersOnTop() {
+        lock.lock()
+        let s = starters.filter { id, _ in let l = coverLevels[id] ?? 0; return l > 0 && coverDepth <= l }.map(\.value)
+        lock.unlock()
+        guard !s.isEmpty else { return }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        s.forEach { $0() }
     }
     private func startRegisteredPlayers() {
         lock.lock(); let s = Array(starters.values); lock.unlock()
@@ -319,9 +361,15 @@ struct DYHoldBoostArea: ViewModifier {
 }
 
 struct PlayerPage: View {
+    @Environment(\.dyRestrictsPlaybackToPane) private var restrictsPlaybackToPane
+
+    private var playbackSafeAreaEdges: Edge.Set {
+        restrictsPlaybackToPane ? [] : .all
+    }
     @Environment(\.dyOfflineVideoPlayback) private var offlineVideoContext
     @Environment(\.duoCleanScreen) private var cleanScreen
     @Environment(\.duoContentInsets) private var chromeInsets
+    @Environment(\.ddCoverLevel) private var coverLevel
     let id: String
     let url: URL
     let knownDuration: Double
@@ -388,6 +436,7 @@ struct PlayerPage: View {
     }
 
     @State private var player: AVPlayer?
+    @AppStorage(DYAutoPiP.storageKey) private var autoPiP = false
     @StateObject private var pictureInPicture = DYPictureInPicture()
     @State private var imgGen: AVAssetImageGenerator?
     @State private var duration: Double = 0
@@ -516,7 +565,7 @@ struct PlayerPage: View {
             // 实时环境光：盖在模糊封面上，出第一帧后淡入；VLC 兜底时没有 AVPlayerItem，保留封面
             if ambientLevel > 0, vlc == nil, let player {
                 DYAmbientBackdrop(player: player, active: isActive, dim: Double(ambientLevel) / 100, fillWidth: fillWidth)
-                    .ignoresSafeArea()
+                    .ignoresSafeArea(edges: playbackSafeAreaEdges)
                     .allowsHitTesting(false)
                     .accessibilityIdentifier("douyin.video.ambient")
             }
@@ -679,7 +728,7 @@ struct PlayerPage: View {
             let playsInsideCover = offlineContext?.inLibrary == true && UIApplication.shared.applicationState == .active
             DDPlayback.shared.register(playbackID, stop: { pauseForBackground() }, start: { resumeAfterBackground() },
                                        retainsAudioSession: { !DDPlayback.shared.coverHold && pictureInPicture.keepsPlaybackOnExit },
-                                       playsInsideCover: playsInsideCover)
+                                       playsInsideCover: playsInsideCover, coverLevel: coverLevel)
         }
         .onDisappear {
             playbackIsActive = false
@@ -705,7 +754,7 @@ struct PlayerPage: View {
             // 被信息页/我的/设置等盖住时不许自己起播：以前每个播放器都直接监听回前台并恢复，
             // 绕过了 DDPlayback 的遮罩计数 → 停在信息页切出去再回来，外面的视频照样出声。
             // 遮罩期间交给 DDPlayback.releaseCover() 在真正回到首页时统一恢复。
-            guard !DDPlayback.shared.coverHold || offlineContext?.inLibrary == true else {
+            guard DDPlayback.shared.isUncovered(level: coverLevel) || offlineContext?.inLibrary == true else {
                 DYLiveModel.log("DDRESUME skip id=\(id.suffix(6)) cover")
                 return
             }
@@ -731,6 +780,10 @@ struct PlayerPage: View {
             setup()
         }
         .onChange(of: cleanScreen) { _, _ in
+            guard let p = player, vlc == nil else { return }
+            bindSeamlessAudio(to: p, initialPos: p.currentTime().seconds, active: isActive, playing: isPlaying)
+        }
+        .onChange(of: autoPiP) { _, _ in
             guard let p = player, vlc == nil else { return }
             bindSeamlessAudio(to: p, initialPos: p.currentTime().seconds, active: isActive, playing: isPlaying)
         }
@@ -829,14 +882,15 @@ struct PlayerPage: View {
         ZStack {
             if let vlc {
                 // 画面铺到屏幕边缘（状态栏/底部安全区也盖住）：跟抖音原生一样，不留上下黑边
-                VLCPlayerSurface(controller: vlc, fillWidth: fillsVideoPlane).ignoresSafeArea()
+                VLCPlayerSurface(controller: vlc, fillWidth: fillsVideoPlane).ignoresSafeArea(edges: playbackSafeAreaEdges)
             } else if let player {
                 // 画面层真正有帧可显示（isReadyForDisplay）就撤掉封面：预加载 / 本地缓存的视频滑过来就是真画面，
                 // 不再「先闪一下封面再播」
                 ZStack {
                     VideoSurface(player: player, fillWidth: fillsVideoPlane, onReady: { if !firstFrame { firstFrame = true }; DYReadiness.mark(id) },
                                  pictureInPicture: pictureInPicture,
-                                 pictureInPictureEnabled: cleanScreen && isActive,
+                                 pictureInPictureEnabled: DYAutoPiP.shortVideoWantsAutomaticPiP(
+                                     preference: autoPiP, cleanScreen: cleanScreen, isActive: isActive),
                                  onPictureInPictureClose: {
                                      userPaused = true
                                      pauseInlineForBackground()
@@ -844,12 +898,12 @@ struct PlayerPage: View {
                                  onPictureInPictureUnavailable: {
                                      if !DDPlayback.bgPlay { pauseInlineForBackground() }
                                  })
-                        .ignoresSafeArea()
+                        .ignoresSafeArea(edges: playbackSafeAreaEdges)
                     // 头部缓存接在线流：新播放器先叠在上面亮相（已缓冲、时间点对齐），再撤掉旧的，
                     // 避免换 AVPlayerLayer 的 player 时断帧
                     if let np = nextPlayer {
                         VideoSurface(player: np, fillWidth: fillsVideoPlane)
-                            .ignoresSafeArea()
+                            .ignoresSafeArea(edges: playbackSafeAreaEdges)
                             .opacity(nextOpacity)
                             .allowsHitTesting(false)
                     }
@@ -859,7 +913,7 @@ struct PlayerPage: View {
             }
             if vlc == nil, let hd = hdPlayer {
                 // 0.001 而不是 0：完全透明的层可能不出画面，换上来时会黑一下
-                VideoSurface(player: hd, fillWidth: fillsVideoPlane).ignoresSafeArea()
+                VideoSurface(player: hd, fillWidth: fillsVideoPlane).ignoresSafeArea(edges: playbackSafeAreaEdges)
                     .opacity(hdVisible ? 1 : 0.001).allowsHitTesting(false)
             }
             // 不再铺首帧图/封面临时顶替：出帧前就是纯黑，出帧即真画面（老板嫌「开头跳一下预览图」）
@@ -1133,8 +1187,9 @@ struct PlayerPage: View {
                 seamAudio.loopToZero(rate: playRate, muted: muted)
             }
         }
-        seamAudio.bind(player: p, initialPosition: initialPos, isActive: active, isPlaying: playing, rate: playRate, muted: muted, useEngine: !cleanScreen && DDSeamlessController.engineWanted,
-                       engineHandoff: !cleanScreen)
+        let nativeAudio = DYAutoPiP.bindsNativeAudio(preference: autoPiP, cleanScreen: cleanScreen)
+        seamAudio.bind(player: p, initialPosition: initialPos, isActive: active, isPlaying: playing, rate: playRate, muted: muted,
+                       useEngine: !nativeAudio && DDSeamlessController.engineWanted, engineHandoff: !nativeAudio)
     }
 
     private func setup(prepared: AVPlayer? = nil) {
@@ -1451,7 +1506,12 @@ struct PlayerPage: View {
     private func pauseForBackground() {
         let behindOfflineLibrary = DDPlayback.shared.offlineLibraryPresented && offlineContext?.inLibrary != true
         if behindOfflineLibrary, DDRemoteOwner.instance == playbackID { clearRemote() }
-        if !behindOfflineLibrary && !DDPlayback.shared.coverHold && pictureInPicture.keepsPlaybackOnExit { return }
+        if !behindOfflineLibrary && !DDPlayback.shared.coverHold && pictureInPicture.keepsPlaybackOnExit {
+            // 要进系统画中画：前台变速时声音可能交给了独立引擎，小窗只认 AVPlayer 原生声音 → 先交回再离开。
+            // 这里由 DDPlayback.pauseAll 在停引擎之前调用，交回后引擎停了也不影响原生声音。
+            seamAudio.returnToNativeAudio(reason: "pip-exit")
+            return
+        }
         if !behindOfflineLibrary && DDPlayback.bgPlay { return }
         pauseInlineForBackground()
     }

@@ -88,7 +88,10 @@ private struct DYListPage: Decodable { let status: Int; let items: [DYAweme]; le
 private struct DYDanmakuPage: Decodable { let status: Int; let items: [DYDanmaku] }
 
 private struct DYReplyPage: Decodable { let status: Int; let items: [DYComment]; let cursor: Int; let hasMore: Bool; let msg: String? }
-private struct DYPublishResp: Decodable { let status: Int; let code: Int?; let msg: String?; let comment: DYComment?; let danmakuID: String?; let diagnostic: String? }
+/// 一次性结束标记（firstWithin 用：结果和超时谁先到算谁）
+@MainActor final class DYOnceFlag { var done = false; init() {} }
+
+private struct DYPublishResp: Decodable { let status: Int; let code: Int?; let msg: String?; let comment: DYComment?; let danmakuID: String?; let diagnostic: String?; var verify: String? = nil }
 private struct DYUserResp: Decodable { let status: Int; let user: DYUser?; let msg: String? }
 private struct DYSugResp: Decodable { let status: Int; let items: [DYSug] }
 
@@ -261,6 +264,50 @@ extension DouyinBridge {
 
 
 
+    /// 返回 nil = 网页评论框这一步没把评论发出去（确定没发），可以退回接口方式；
+    /// 只要点过发送且结果不明，就抛「未确认」，绝不再用别的方式补发，免得重复评论。
+    private func publishViaWebUI(_ awemeID: String, text: String, replyID: String?, replyToReplyID: String?, op: String) async throws -> DYComment? {
+        let target = replyToReplyID ?? replyID
+        DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-submit reply=\(replyID == nil ? 0 : 1)/\(replyToReplyID == nil ? 0 : 1)")
+        let o: DYWebComposer.Outcome
+        do { o = try await DYWebComposer.shared.publish(awemeID: awemeID, text: text, top: replyID, replyTo: target, host: web.superview) }
+        catch {
+            DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-error")
+            return nil
+        }
+        DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-\(o.state) stage=\(o.stage ?? "-") status=\(o.status.map(String.init) ?? "nil") code=\(o.code.map(String.init) ?? "nil") diag=\(o.diagnostic ?? "-")")
+        switch o.state {
+        case "sent":
+            if let c = o.comment, Self.isServerCommentID(c.id) { return c }
+            throw DYCommentUnconfirmed(message: "抖音回了成功但没给评论编号；先刷新评论区核对")
+        case "blocked":
+            // 与接口方式一致：403 后服务端常常同时作废登录，交给恢复页核验
+            throw DYLoginExpired()
+        case "rejected":
+            if o.code == 8 { throw DYLoginExpired() }
+            throw DYError.bad(o.msg?.isEmpty == false ? o.msg! : "评论被拒绝（\(o.code ?? -1)），草稿已保留")
+        case "unconfirmed":
+            // 已点发送但回执读不到：和接口方式一样，限时回评论区找自己刚发的这条
+            let identity = try? await selfProfile()
+            if let mine = await Self.firstWithin(Self.reconcileTimeout, { [weak self] in
+                await self?.findMySentComment(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID,
+                                              imageSentAt: Date().timeIntervalSince1970 - 30, identity: identity, hasImage: false)
+            }) {
+                DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-verified")
+                return mine
+            }
+            DYLiveModel.log("DDSEND comment op=\(op) phase=web-ui-reconcile-miss")
+            throw DYCommentUnconfirmed(message: o.msg ?? "结果未确认，可能已发出；先刷新评论区核对")
+        case "logged-out":
+            throw DYLoginExpired()
+        case "busy":
+            throw DYError.bad("上一条评论还在发送，稍等再发；草稿已保留")
+        default:
+            // not-ready / not-found / compose-error / not-sent：确定没有发出请求
+            return nil
+        }
+    }
+
     func fetchReplies(_ id: String, commentID: String, cursor: Int) async throws -> (items: [DYComment], cursor: Int, hasMore: Bool) {
         let d = try await call(Self.replyJS, args: ["id": id, "cid": commentID, "cursor": String(cursor)], attempts: 1)
         let p = try JSONDecoder().decode(DYReplyPage.self, from: d)
@@ -276,58 +323,173 @@ extension DouyinBridge {
         let args: [String: Any] = ["id": awemeID, "text": text, "reply": replyID ?? "0", "replyTo": replyToReplyID ?? "0",
                                    "imgUri": image?.uri ?? "", "imgW": String(image?.width ?? 0),
                                    "imgH": String(image?.height ?? 0), "imgFmt": image?.format ?? ""]
-        let sentAt = Date().timeIntervalSince1970
-        await ensureWriteReady()
-        let d = try await call(Self.publishJS, args: args, attempts: 1)
-        let r = try JSONDecoder().decode(DYPublishResp.self, from: d)
-        DYLiveModel.log("DDSEND comment status=\(r.status) code=\(r.code ?? -1) msg=\(r.msg ?? "-") diag=\(r.diagnostic ?? "-")")
-        // code 8：抖音不认这份登录。真机常见「能看不能写」的半失效登录（资料、作品照常读，评论被拒，老板 11-18），
-        // 让界面直接弹登录页重新登录，不再叫用户自己去「我的」找入口（那里显示已登录，根本没有「去登录」）
-        if r.code == 8 { throw DYLoginExpired() }
-        if r.status == 200, (r.code ?? 0) == 0, let c = r.comment {
-            // 回执里没带图片地址时，去评论列表里把这条带图的找回来，不然本地显示成一条空评论
-            if image != nil, (c.images ?? []).isEmpty,
-               let mine = await findMySentComment(awemeID, text: text, replyID: replyID, imageSentAt: sentAt) { return mine }
-            return c
+        let operationID = UUID().uuidString
+        DYLiveModel.log("DDSEND comment op=\(operationID) phase=prepare")
+        // 纯文字（含回复/楼中楼）走「真人方式」：抖音网页自己的评论框 + 发送按钮。带图仍走接口。
+        if image == nil, DYWebComposer.enabled {
+            if let c = try await publishViaWebUI(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID, op: operationID) {
+                return c
+            }
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=web-ui-fallback")
         }
-        // 网页评论框的两个明确失败码：19 = 评论功能受限，3002575 = 健康分
-        if r.code == 19 { throw DYError.bad(r.msg?.isEmpty == false ? r.msg! : "由于违反社区规定，评论功能受限") }
-        if r.code == 3002575 { throw DYError.bad(r.msg?.isEmpty == false ? r.msg! : "发布失败，账号健康分受限") }
-        if r.code == 50015 || (r.msg ?? "").contains("不支持") || (r.msg ?? "").contains("关闭") { throw DYError.bad(r.msg!) }
-        // 空响应/403 不代表没发出去：抖音常已写入但不回执，先去评论/楼中楼里核对，避免用户重复发送
-        if let mine = await findMySentComment(awemeID, text: text, replyID: replyID, imageSentAt: image == nil ? nil : sentAt) {
-            DYLiveModel.log("DDSEND verified-posted cid=\(mine.id) aweme=\(awemeID)")
-            return mine
+        guard await ensureWriteReady() else {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=not-ready")
+            throw DYError.bad("评论签名页尚未就绪，未发送；草稿已保留")
         }
-        throw DYError.bad("抖音没给回执，评论里也没查到这条（HTTP \(r.status) / \(r.diagnostic ?? "-")）。可能被风控限制，歇一会儿再试，别连续重发")
+        // 在写入前获取本次身份；无法获取时可发一次，但不能把列表里的其他评论当作确认。
+        let identity = try? await selfProfile()
+        do {
+            return try await publishViaAPI(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID,
+                                           image: image, args: args, identity: identity, operationID: operationID, phase: "submit")
+        } catch let v as DYCommentNeedsVerify {
+            // 官方网页版同款：抖音要求身份验证 → 弹官方验证 → 通过后把同一条再发一次（只一次，不循环）
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=verify-required")
+            switch await DYPassportVerify.run(decision: v.decision) {
+            case .passed:
+                do {
+                    return try await publishViaAPI(awemeID, text: text, replyID: replyID, replyToReplyID: replyToReplyID,
+                                                   image: image, args: args, identity: identity, operationID: operationID, phase: "resubmit")
+                } catch is DYCommentNeedsVerify {
+                    DYLiveModel.log("DDSEND comment op=\(operationID) phase=verify-again")
+                    throw DYError.bad("验证通过了，但抖音仍要求验证，这条没发出去；草稿已保留，稍后再试")
+                }
+            case .cancelled:
+                throw DYError.bad("已取消身份验证，这条没发出去；草稿已保留")
+            case .failed(let why):
+                throw DYError.bad("身份验证没完成（\(why)），这条没发出去；草稿已保留")
+            }
+        }
     }
 
-    /// 发送后核对：楼中楼查这一级评论的回复，一级评论查最新评论；按「我的昵称 + 正文开头」匹配
-    /// imageSentAt 非空 = 这条带图：还要求评论里有图、时间不早于发送前两分钟；纯图评论没有正文可比，必须认得出是我发的
-    private func findMySentComment(_ awemeID: String, text: String, replyID: String?, imageSentAt: Double? = nil) async -> DYComment? {
-        let norm = { (s: String) in s.replacingOccurrences(of: "\\s+", with: "", options: .regularExpression) }
-        let want = norm(text)
-        guard !want.isEmpty || imageSentAt != nil else { return nil }
-        let me = (try? await selfProfile())?.name ?? ""
-        if want.isEmpty, me.isEmpty { return nil }
-        func match(_ items: [DYComment]) -> DYComment? {
-            items.first { c in
-                let t = norm(c.text)
-                let head = String(want.prefix(12))
-                let textOK = want.isEmpty ? t.isEmpty : (t == want || t.hasPrefix(head) || want.hasPrefix(String(t.prefix(12))))
-                let imageOK = imageSentAt.map { !(c.images ?? []).isEmpty && c.time >= $0 - 120 } ?? true
-                return textOK && imageOK && (me.isEmpty || c.name == me)
+    /// 接口方式发一次。抖音要求身份验证且确认没收下时抛 DYCommentNeedsVerify（由上层弹验证后重发一次）。
+    private func publishViaAPI(_ awemeID: String, text: String, replyID: String?, replyToReplyID: String?, image: DYImageXUploadResult?,
+                               args: [String: Any], identity: DYUser?, operationID: String, phase: String) async throws -> DYComment {
+        let sentAt = Date().timeIntervalSince1970
+        DYLiveModel.log("DDSEND comment op=\(operationID) phase=\(phase)")
+        let d: Data
+        do { d = try await call(Self.publishJS, args: args, attempts: 1) }
+        catch {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=transport-unknown")
+            throw DYCommentUnconfirmed(message: "结果未确认，可能已发出；先刷新评论区核对")
+        }
+        guard let r = try? JSONDecoder().decode(DYPublishResp.self, from: d) else {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=decode-unknown")
+            throw DYCommentUnconfirmed(message: "回执无法识别，可能已发出；先刷新评论区核对")
+        }
+        // 服务端文案、正文、账号标识与响应全文不入日志。
+        DYLiveModel.log("DDSEND comment op=\(operationID) phase=response status=\(r.status) code=\(r.code.map(String.init) ?? "nil") diag=\(r.diagnostic ?? "-")")
+        if r.status == -4 {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=not-ready-js")
+            throw DYError.bad("评论签名页尚未就绪，未发送；草稿已保留")
+        }
+        if r.code == 8 {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=verification-required")
+            throw DYLoginExpired()
+        }
+        if r.status == 200, r.code == 0, let c = r.comment, Self.isServerCommentID(c.id) {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=acknowledged")
+            return c
+        }
+        // 明确业务拒绝不回查为成功，也不重试写请求。
+        if let code = r.code, code != 0 {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=rejected")
+            throw DYError.bad(r.msg?.isEmpty == false ? r.msg! : "评论被拒绝（\(code)），草稿已保留")
+        }
+        // 回查有总时限：读接口在风控期间可能被安全 SDK 压住十几秒，界面不能一直转圈（老板 11-18 实测卡约 30 秒）。
+        DYLiveModel.log("DDSEND comment op=\(operationID) phase=reconcile")
+        let started = Date()
+        let mine = await Self.firstWithin(Self.reconcileTimeout) { [weak self] in
+            await self?.findMySentComment(awemeID, text: text, replyID: replyID,
+                                          replyToReplyID: replyToReplyID, imageSentAt: sentAt,
+                                          identity: identity, hasImage: image != nil)
+        }
+        if let mine {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=verified")
+            return mine
+        }
+        let waited = Int(Date().timeIntervalSince(started) * 1000)
+        // 空回执 + 要求身份验证，且回查确认评论区里没有这条：确定没收下，交给上层弹验证
+        if let decision = r.verify, !decision.isEmpty, r.comment == nil {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=needs-verify waitedMs=\(waited)")
+            throw DYCommentNeedsVerify(decision: decision)
+        }
+        // 403 空响应：签名完整仍被拒，属于抖音对这次写入的拦截（常伴随验证要求），引导去网页版处理，不自动重发
+        if r.status == 403 {
+            DYLiveModel.log("DDSEND comment op=\(operationID) phase=blocked-403 waitedMs=\(waited)")
+            throw DYLoginExpired()
+        }
+        DYLiveModel.log("DDSEND comment op=\(operationID) phase=unknown waitedMs=\(waited)")
+        throw DYCommentUnconfirmed(message: "结果未确认，可能已发出；先刷新评论区核对")
+    }
+
+    /// 发送后回查的总时限（秒）。超时按「结果未知」处理，不当成功、不重发。
+    static var reconcileTimeout: Double = 8
+
+    /// 在时限内取结果：到点直接返回 nil，后台那次读取自己跑完即丢弃（WebView 里的 JS 调用无法取消）。
+    static func firstWithin<T>(_ seconds: Double, _ work: @escaping @MainActor () async -> T?) async -> T? {
+        let once = DYOnceFlag()
+        return await withCheckedContinuation { (cont: CheckedContinuation<T?, Never>) in
+            Task { @MainActor in
+                let v = await work()
+                if !once.done { once.done = true; cont.resume(returning: v) }
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                if !once.done { once.done = true; cont.resume(returning: nil) }
             }
         }
-        if let rid = replyID, !rid.isEmpty, rid != "0",
-           let p = try? await fetchReplies(awemeID, commentID: rid, cursor: 0), let m = match(p.items) { return m }
-        if let p = try? await fetchComments(awemeID, cursor: 0) {
-            if let m = match(p.items) { return m }
-            for c in p.items where c.replies > 0 {
-                if let q = try? await fetchReplies(awemeID, commentID: c.id, cursor: 0), let m = match(q.items) { return m }
+    }
+
+    private static func isServerCommentID(_ id: String) -> Bool {
+        !id.isEmpty && id != "0" && id.utf8.allSatisfy { $0 >= 48 && $0 <= 57 }
+    }
+
+    /// 仅核对本次身份、本次发送时间、精确正文和目标楼层；证据不足就是未知。
+    /// 图片本身无法精确比对，纯图不作列表确认。最多只读本次目标楼层，不跨楼搜索。
+    private func findMySentComment(_ awemeID: String, text: String, replyID: String?, replyToReplyID: String?,
+                                   imageSentAt sentAt: Double, identity: DYUser?, hasImage: Bool) async -> DYComment? {
+        guard !text.isEmpty, let me = identity, !me.secUid.isEmpty || !me.uid.isEmpty else { return nil }
+        let parent = replyID.flatMap { $0.isEmpty || $0 == "0" ? nil : $0 }
+        let target = replyToReplyID.flatMap { $0.isEmpty || $0 == "0" ? nil : $0 }
+        let items: [DYComment]
+        if let parent {
+            guard let page = try? await fetchReplies(awemeID, commentID: parent, cursor: 0) else { return nil }
+            items = page.items
+        } else {
+            guard target == nil, let page = try? await fetchComments(awemeID, cursor: 0) else { return nil }
+            items = page.items
+        }
+        let now = Date().timeIntervalSince1970
+        let matches = items.filter { c in
+            // 若双方都有同类 ID，任何冲突都拒绝；至少要有一组稳定 ID 相等。
+            let secMatches = !me.secUid.isEmpty && c.sec?.isEmpty == false && c.sec == me.secUid
+            let uidMatches = !me.uid.isEmpty && c.uid?.isEmpty == false && c.uid == me.uid
+            if !me.secUid.isEmpty, let sec = c.sec, !sec.isEmpty, sec != me.secUid { return false }
+            if !me.uid.isEmpty, let uid = c.uid, !uid.isEmpty, uid != me.uid { return false }
+            // 不给时间向前容差；服务端只有秒级时间而无法排除发送前旧评论时，宁可保持未知。
+            guard secMatches || uidMatches, Self.isServerCommentID(c.id), c.text == text,
+                  c.time >= sentAt, c.time <= now,
+                  !hasImage || !(c.images ?? []).isEmpty else { return false }
+            let actualParent = c.parent.flatMap { $0.isEmpty || $0 == "0" ? nil : $0 }
+            let actualTarget = c.replyTo.flatMap { $0.isEmpty || $0 == "0" ? nil : $0 }
+            return actualParent == parent && actualTarget == target
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    /// 发完回复后核对：在那条一级评论的回复里翻前 3 页找这条 id。nil = 读不到，核对不了。
+    func replyIsVisible(_ awemeID: String, thread: String, id: String) async -> Bool? {
+        var cursor = 0
+        for attempt in 0..<2 {
+            if attempt > 0 { try? await Task.sleep(for: .seconds(2)); cursor = 0 }
+            for _ in 0..<3 {
+                guard let page = try? await fetchReplies(awemeID, commentID: thread, cursor: cursor) else { return nil }
+                if page.items.contains(where: { $0.id == id }) { return true }
+                guard page.hasMore, !page.items.isEmpty else { break }
+                cursor = page.cursor
             }
         }
-        return nil
+        return false
     }
 
     /// 删除评论（自己发的，或自己作品下的）。只在用户确认之后调用，不重试。
@@ -364,7 +526,7 @@ extension DouyinBridge {
       const o = cmapImg(x.origin_url) || m;
       return m ? { thumb: m.u, full: o.u, w: o.w || m.w, h: o.h || m.h } : null;
     }).filter(Boolean);
-    const cmap = c => c ? ({ id: String(c.cid), text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
+    const cmap = c => c ? ({ id: typeof c.cid === 'string' ? c.cid : Number.isSafeInteger(c.cid) ? String(c.cid) : '', text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
       digg: c.digg_count || 0, time: c.create_time || Math.floor(Date.now() / 1000), replies: 0, ip: c.ip_label || null,
       images: cmapImages(c) }) : null;
     """#
@@ -387,6 +549,7 @@ extension DouyinBridge {
     }
     // 等安全 SDK 挂钩完成再发；x-secsdk-csrf-token: DOWNGRADE 是网页版写接口的 CSRF 降档标记
     const sdk = typeof sdkReady === 'function' ? await sdkReady(6000) : false;
+    if (!sdk) return JSON.stringify({ status: -4, code: null, msg: '评论签名页尚未就绪，未发送；草稿已保留', comment: null, danmakuID: null, diagnostic: 'sdk=false phase=not-ready' });
     const r = await req('POST', '/aweme/v1/web/comment/publish?' + P, body.toString(), { 'x-secsdk-csrf-token': 'DOWNGRADE' });
     const raw = r.t || '', parsed = parse(raw), d = parsed || {};
     const kind = !raw.trim() ? 'empty' : parsed !== null ? 'json' : /^\s*</.test(raw) ? 'html' : 'other';
@@ -396,13 +559,24 @@ extension DouyinBridge {
     const hooked = (f) => { try { return !/native code/.test(f().toString()); } catch (e) { return 'na'; } };
     const diagnostic = 'kind=' + kind + ' chars=' + raw.length + ' keys=' + keys + ' ident=' + (haveIdent || 'none')
       + ' sdk=' + sdk + ' signed=' + signed + ' img=' + hasImage + ' imgBack=' + ((d.comment && d.comment.image_list) || []).length
+      // 只记 id：请求挂在哪条下面、抖音实际挂到哪条下面、评论状态（判断「发出了却看不到」）
+      + ' req=' + (typeof reply === 'string' && reply ? reply : '0') + '/' + (typeof replyTo === 'string' && replyTo ? replyTo : '0')
+      + ' got=' + (d.comment ? String(d.comment.reply_id ?? '-') + '/' + String(d.comment.reply_to_reply_id ?? '-') + ' st=' + String(d.comment.status ?? '-') : '-')
+      // 只记验证相关响应头「有没有」，不记值（官方网页版靠它们弹滑块/短信验证后重发）
+      + (() => { const h = String(r.h || '').toLowerCase(); const f = n => h.includes('\n' + n + ':') ? 1 : 0;
+          return ' vp=' + f('x-tt-verify-passport-decision') + ' bt=' + f('bdturing-verify') + ' vc=' + f('x-vc-bdturing-parameters')
+            + ' tg=' + f('bd-ticket-guard-result') + ' shark=' + ((d.data && d.data.shark_decision_conf) ? 1 : 0)
+            + ' tgr=' + (() => { const m = h.match(/\nbd-ticket-guard-result:\s*([^\r\n]*)/); if (!m) return '-'; const v = m[1].trim(); return /^-?\d{1,6}$/.test(v) ? v : 'x'; })(); })()
       + ' xhrHooked=' + hooked(() => XMLHttpRequest.prototype.send)
       + ' fetchHooked=' + hooked(() => window.fetch);
     const fallback = kind === 'empty' ? '抖音返回空响应，未能确认评论是否发送，请勿连续重发'
       : kind === 'html' ? '抖音返回了网页而非评论结果，请在网页版查看是否有验证提示'
       : '未收到有效的评论确认结果，请勿连续重发';
     const msg = d.status_msg || ((!d.comment || d.status_code !== 0 || r.s !== 200) ? fallback : null);
-    return JSON.stringify({ status: r.s, code: d.status_code ?? null, msg, comment: cmap(d.comment), danmakuID: null, diagnostic });
+    // 抖音要求身份验证时把头的原值交回 App（只在内存里转给官方验证组件，不进日志）
+    const vm = String(r.h || '').match(/\nx-tt-verify-passport-decision:\s*([^\r\n]*)/i);
+    const verify = !d.comment && vm && vm[1].trim() ? vm[1].trim() : null;
+    return JSON.stringify({ status: r.s, code: d.status_code ?? null, msg, comment: cmap(d.comment), danmakuID: null, diagnostic, verify });
     """#
 
     static let deleteCommentJS = #"""
@@ -583,10 +757,15 @@ extension DouyinBridge {
       const an = ddImg(s.animate_url) || st;
       return { thumb: st.u, full: an.u, w: s.width || st.w, h: s.height || st.h };
     };
+    const ddStableID = v => typeof v === 'string' ? (v && v !== '0' ? v : null) : Number.isSafeInteger(v) && v > 0 ? String(v) : null;
+    const ddCommentID = c => [c.cid, c.user && c.user.uid, c.reply_id, c.reply_to_reply_id].some(v => typeof v === 'number' && !Number.isSafeInteger(v)) ? '' : ddStableID(c.cid) || '';
     const items = (d.comments || []).map(c => ({
-      id: String(c.cid), text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
+      id: ddCommentID(c), text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
       digg: c.digg_count || 0, time: c.create_time || 0, replies: 0, ip: c.ip_label || null,
-      images: ddImages(c), sticker: ddSticker(c) }));
+      images: ddImages(c), sticker: ddSticker(c),
+      uid: ddStableID(c.user && c.user.uid),
+      parent: ddStableID(c.reply_id),
+      replyTo: ddStableID(c.reply_to_reply_id) }));
     return JSON.stringify({ status: r.s, items, cursor: d.cursor || 0, hasMore: !!d.has_more, msg: null });
     """#
 }
@@ -840,13 +1019,19 @@ struct DYGrid: View {
     /// 长按格子出的移除项（例如「移出稍后再看」）。两个都给了才有长按菜单。
     var removeTitle: String? = nil
     var onRemove: ((DYAweme) -> Void)? = nil
+    /// 作者主页：刚刚看过的那条（同抖音：格子上标「刚刚看过」，不在屏上时底部给一键定位）
+    var focusID: String? = nil
     private let cols = [GridItem(.adaptive(minimum: 140), spacing: 2)]
+    @State private var focusVisible = false
 
     @ViewBuilder
     private func gridButton(_ i: Int, _ a: DYAweme) -> some View {
         let button = Button { onOpen(i) } label: { cell(a) }
             .buttonStyle(.plain)
             .accessibilityIdentifier("douyin.grid.item.\(a.id)")
+            .id(a.id)
+            .onAppear { if a.id == focusID { focusVisible = true } }
+            .onDisappear { if a.id == focusID { focusVisible = false } }
         if let onRemove, let removeTitle {
             button.contextMenu {
                 Button(removeTitle, systemImage: "minus.circle", role: .destructive) { onRemove(a) }
@@ -861,6 +1046,7 @@ struct DYGrid: View {
         // 底部哨兵只在真正滚进可视区时才翻页：ScrollView 的非惰性子视图会立刻 onAppear，
         // 直接 onAppear 会一页接一页把作者作品全拉下来（2026-11-07 实测）。
         GeometryReader { outer in
+          ScrollViewReader { proxy in
             ScrollView {
                 LazyVGrid(columns: cols, spacing: 2) {
                     ForEach(Array(items.enumerated()), id: \.element.id) { i, a in
@@ -888,6 +1074,25 @@ struct DYGrid: View {
             .onPreferenceChange(DYBottomYKey.self) { y in
                 if y < outer.size.height - 16 { onLoadMore() }
             }
+            .overlay(alignment: .bottom) {
+                if let focusID, !focusVisible, items.contains(where: { $0.id == focusID }) {
+                    Button {
+                        withAnimation(.snappy) { proxy.scrollTo(focusID, anchor: .center) }
+                        DYLiveModel.log("DDAUTHOR jump-to-recent id=\(focusID)")
+                    } label: {
+                        Label("定位到刚刚看过", systemImage: "scope")
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+                    .padding(.bottom, 20)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .accessibilityIdentifier("douyin.author.jumpRecent")
+                }
+            }
+            .animation(.snappy, value: focusVisible)
+          }
         }
     }
 
@@ -899,6 +1104,22 @@ struct DYGrid: View {
                     placeholder: { Color.white.opacity(0.06) }
             }
             .clipped()
+            .overlay {
+                if a.id == focusID {
+                    Rectangle().strokeBorder(Color.white.opacity(0.9), lineWidth: 2)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if a.id == focusID {
+                    Text("刚刚看过")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Color.black.opacity(0.6), in: .rect(cornerRadius: 4))
+                        .padding(5)
+                        .accessibilityIdentifier("douyin.grid.recent")
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 if !a.images.isEmpty {
                     Image(systemName: "photo.on.rectangle").font(.caption).foregroundStyle(.white).padding(6)
@@ -1000,8 +1221,8 @@ struct DYListPlayer: View {
     let commentFocus: DYCommentFocus?
     /// 信息里点开的分享视频：关掉时彻底收掉声音（播放器、音频引擎、音频会话）
     let hardStopOnDismiss: Bool
-    /// 打开期间把外层（首页/信息页底下的）播放压住；关掉时成对释放
-    @State private var coverHeld = false
+    /// 打开时外面已经盖了几层遮罩（信息页 / 我的）：这个播放器就在那一层之上，可以照常播
+    @State private var coverLevel = DDPlayback.shared.coverDepth
     /// 点头像时作者页由播放器自己弹在上面。播放器是全屏页：交给底下的页面弹，会被播放器盖住，
     /// 要返回关掉播放器后才看到（老板 11-16 报：搜索出来的视频点头像不跳，返回才跳）
     let presentsAuthor: Bool
@@ -1077,6 +1298,7 @@ struct DYListPlayer: View {
         .environment(\.duoSystemBars, true)
         .environment(\.duoCleanScreen, false)
         .environment(\.duoInlineVideoNavigation, false)
+        .environment(\.ddCoverLevel, offlineLibrary ? 0 : coverLevel)
         .onReceive(DYOfflineDownloads.shared.$isOffline.removeDuplicates()) { offline in
             guard offlineLibrary else { return }
             networkIsOffline = offline
@@ -1143,7 +1365,7 @@ struct DYListPlayer: View {
         @Bindable var playback = playback
         if offlineLibrary {
             DYFeedPager(items: playback.items, currentID: $playback.currentID, scrollID: $scrollPos,
-                        userScrolling: $userScrolling, scrollEndTask: $scrollEndTask) { item in
+                        userScrolling: $userScrolling, scrollEndTask: $scrollEndTask) { item, _ in
                 page(item, insets: insets)
             }
             .accessibilityElement(children: .contain)
@@ -1970,7 +2192,10 @@ struct DYAuthorScreen: View {
     let onWeb: (URL) -> Void
     var onClose: (() -> Void)? = nil
     var onWorkPresentationChange: ((Bool) -> Void)? = nil
+    /// 刚刚看过的作品 ID；不传就取打开主页那一刻正在播的视频（只有它确实是这个作者的作品才会标出来）
+    var focusAwemeID: String? = nil
     @Environment(\.dismiss) private var dismiss
+    @State private var recentID: String?
     @State private var user: DYUser?
     @State private var err: String?
     @State private var posts: [DYAweme] = []
@@ -2016,7 +2241,7 @@ struct DYAuthorScreen: View {
             DYGrid(items: posts, hasMore: hasMore, loading: loading, error: postErr, onLoadMore: { requestMore() }, onOpen: { i in
                 onWorkPresentationChange?(true)
                 player = DYAuthorPlay(playback: DYListPlayback(items: posts, start: i))
-            })
+            }, focusID: recentID)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityIdentifier("douyin.author.works")
         }
@@ -2049,7 +2274,12 @@ struct DYAuthorScreen: View {
         } message: {
             Text(blocked ? "解除拉黑后，对方可以搜索到你，可以给你发私信" : "拉黑后，对方将无法搜索到你，也不能给你发私信")
         }
-        .fullScreenCover(item: $player, onDismiss: { onWorkPresentationChange?(false) }) { p in
+        .fullScreenCover(item: $player, onDismiss: {
+            onWorkPresentationChange?(false)
+            // 从主页点开作品看完回来：「刚刚看过」换成最后停留的那条
+            let last = DDNowPlaying.id
+            if !last.isEmpty, posts.contains(where: { $0.id == last }) { recentID = last }
+        }) { p in
             DYListPlayer(bridge: bridge, title: author.name.isEmpty ? "作品" : author.name, playback: p.playback,
                          loadMore: { await loadPosts() }, onAuthor: { _ in })
         }
@@ -2071,7 +2301,27 @@ struct DYAuthorScreen: View {
             }
             #endif
             _ = await loadPosts()
+            await locateRecent(s)
         }
+    }
+
+    /// 同抖音：刚刚看过的作品不在第一页时继续往下翻，直到翻到它（先核实它确实是这个作者的，别白翻）
+    private func locateRecent(_ sec: String) async {
+        let candidate = focusAwemeID ?? (DDNowPlaying.id.isEmpty ? nil : DDNowPlaying.id)
+        guard let id = candidate, !id.isEmpty else { return }
+        if posts.contains(where: { $0.id == id }) { recentID = id; DYLiveModel.log("DDAUTHOR recent found page=1 id=\(id)"); return }
+        guard hasMore, let item = try? await bridge.awemeDetail(id), item.author.secUid == sec else { return }
+        for page in 2...30 {
+            guard hasMore, !Task.isCancelled else { break }
+            while loading { try? await Task.sleep(for: .milliseconds(120)) }
+            _ = await loadPosts()
+            if posts.contains(where: { $0.id == id }) {
+                recentID = id
+                DYLiveModel.log("DDAUTHOR recent found page=\(page) id=\(id)")
+                return
+            }
+        }
+        DYLiveModel.log("DDAUTHOR recent not found id=\(id) n=\(posts.count)")
     }
 
     private func close() { if let onClose { onClose() } else { dismiss() } }

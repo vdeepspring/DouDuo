@@ -70,6 +70,12 @@ test('group video card (aweType 11054, item_id) opens the post',()=>{
   const r=clickThroughHook({aweType:11054,item_id:vid,aweme_info:{aweme_id:vid}},'/chat');
   assert.strictEqual(r.sent[0].type,'video');assert.strictEqual(r.sent[0].id,vid);
 });
+test('private-chat video card (aweType 11055, real 11-18 keys) opens the post natively',()=>{
+  const vid='7708057869924972646';
+  const r=clickThroughHook({aweType:11055,item_id:vid,aweme_info:{aweme_id:vid},cover_url:{},description:'',schema:''},'/chat');
+  assert.strictEqual(r.sent[0].type,'video');assert.strictEqual(r.sent[0].id,vid);
+  assert(r.ev.prevented&&r.ev.stopped);
+});
 test('group video card with only aweme_info.aweme_id opens the post',()=>{
   const vid='7708057869924972646';
   const r=clickThroughHook({aweType:11054,aweme_info:{aweme_id:vid}},'/chat');

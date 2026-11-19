@@ -48,6 +48,7 @@ extension DYRecommendFeedHost {
     /// 点**已选中的「推荐」= 刷新推荐**；其它情况交给各界面自己的 `switchTab`（经典有跟手切换动画）。
     /// 滑动切换、程序切换（调试 / 回到推荐）不走这里，不会误刷新。
     func tapChannel(_ target: DYTab, switchTab: (DYTab) -> Void) {
+        DYLiveModel.log("DDTAB tap target=\(target) from=\(tab)")
         if target == .recommend, tab == .recommend {
             DYLiveModel.log("DDREFRESH tap selected recommend")
             #if DEBUG

@@ -716,6 +716,31 @@ final class DDSeamlessController {
         }
     }
 
+    /// 变速时交给引擎的这一条，就地把声音还给 AVPlayer 原生音轨（离开 App 前调用：系统画中画只认原生声音）。
+    /// 引擎停、原生音轨开、按当前目标速率继续；之后在前台再变速还会重新交给引擎。
+    /// - Returns: 真的从引擎（或进行中的交接）切回来了才返回 true
+    @discardableResult
+    func returnToNativeAudio(reason: String) -> Bool {
+        guard mode == .fallbackAVPlayer || (mode == .engaged && engagedByHandoff) else { return false }
+        let wasPending = handoffPending
+        let wasEngaged = mode == .engaged
+        guard wasPending || wasEngaged else { return false }
+        let heard = currentMediaTime
+        if wasPending { cancelHandoff() }
+        if wasEngaged {
+            stopEngineOutput()
+            engagedByHandoff = false
+            mode = .fallbackAVPlayer
+            itemTracksObs?.invalidate(); itemTracksObs = nil
+        }
+        guard let vp = videoPlayer else { return true }
+        if let it = vp.currentItem { DDAudioStream.enableAudioTracks(on: it) }
+        vp.isMuted = isMuted
+        if wantPlaying, abs(vp.rate - targetRate) > 0.001 { vp.rate = targetRate }
+        DYLiveModel.log("DDSEAM back-to-native reason=\(reason) engaged=\(wasEngaged) pending=\(wasPending) rate=\(targetRate) v=\(String(format: "%.2f", vp.currentTime().seconds)) a=\(heard.map { String(format: "%.2f", $0) } ?? "-")")
+        return true
+    }
+
     private func beginEngineHandoff() {
         guard let vp = videoPlayer, let item = vp.currentItem, let asset = item.asset as? AVURLAsset else {
             handoffAllowed = false
